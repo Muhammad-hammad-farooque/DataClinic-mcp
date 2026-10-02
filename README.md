@@ -1,5 +1,7 @@
 # DataClinic MCP
 
+[![CI](https://github.com/Muhammad-hammad-farooque/DataClinic-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Muhammad-hammad-farooque/DataClinic-mcp/actions/workflows/ci.yml)
+
 An MCP server that lets an AI assistant run a full exploratory data analysis
 workflow — inspect a dataset, diagnose what is wrong with it, fix it, and write
 the result back out.
