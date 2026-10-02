@@ -22,9 +22,10 @@ from eda_mcp.digest import BUDGETS, Finding, Response, Severity, fit
 from eda_mcp.errors import EDAError, ErrorCode, SourceTooLargeError
 from eda_mcp.instructions import INSTRUCTIONS
 from eda_mcp.issues import column_findings, frame_findings, needs_attention
+from eda_mcp.issues import find_issues as detect_issues
 from eda_mcp.loaders import load_file
 from eda_mcp.logging import configure, get_logger, new_correlation_id, tool_call
-from eda_mcp.profiling import column_kinds, orientation, profile_frame, summarise
+from eda_mcp.profiling import column_kinds, duplicated, orientation, profile_frame, summarise
 from eda_mcp.registry import Registry
 
 # Behavioural hints let a client skip confirmation on safe calls. read_only
@@ -40,6 +41,13 @@ DETAIL_LEVELS = ("brief", "standard", "full")
 # a fixed share of the budget and findings absorb the rest.
 PROFILE_COLUMN_SHARE = 0.6
 ROLLUP_NAMES = 20
+# The lowest severity rank each find_issues filter keeps.
+SEVERITY_FLOORS = {
+    "all": Severity.INFO.rank,
+    "low": Severity.LOW.rank,
+    "medium": Severity.MEDIUM.rank,
+    "high": Severity.HIGH.rank,
+}
 
 
 def _unexpected(exc: Exception) -> dict[str, Any]:
@@ -198,7 +206,7 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                     "shape": [int(df.shape[0]), int(df.shape[1])],
                 }
                 if not columns:
-                    body["duplicate_rows"] = int(df.duplicated().sum())
+                    body["duplicate_rows"] = int(duplicated(df).sum())
                 if blocks:
                     body["columns"] = blocks
                 clean = [p.name for p in profiles if p.name not in problem]
@@ -226,6 +234,60 @@ def build_server(settings: Settings | None = None) -> MCPServer:
 
                 record["columns_shown"] = len(blocks)
                 record["findings"] = len(findings)
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
+        name="find_issues",
+        description=(
+            "Every data-quality problem in a loaded dataset, ranked, each with the fix "
+            "to apply. Adds cross-column checks profile does not run: missingness tied "
+            "to other columns, identical columns, records repeated under new keys. "
+            "severity is 'all', 'low', 'medium' or 'high' (the lowest level returned)."
+        ),
+        annotations=READ_ONLY_EXTERNAL,
+    )
+    def find_issues(source: str, severity: str = "all") -> dict[str, Any]:
+        try:
+            with tool_call("find_issues", source=source, severity=severity) as record:
+                if severity not in SEVERITY_FLOORS:
+                    raise EDAError(
+                        ErrorCode.INVALID_OPERATION,
+                        f"unknown severity {severity!r}",
+                        f"use one of {', '.join(SEVERITY_FLOORS)}",
+                    )
+                df = registry.get_dataset(source).df
+                kinds = column_kinds(df)
+                every = detect_issues(df, kinds, profile_frame(df, kinds))
+                floor = SEVERITY_FLOORS[severity]
+                kept = [f for f in every if f.severity.rank <= floor]
+
+                counts = {
+                    level.value: sum(1 for f in every if f.severity is level)
+                    for level in (Severity.HIGH, Severity.MEDIUM, Severity.LOW)
+                }
+                body: dict[str, Any] = {
+                    "dataset": source,
+                    "shape": [int(df.shape[0]), int(df.shape[1])],
+                    "counts": {k: v for k, v in counts.items() if v},
+                }
+                response = Response(
+                    "find_issues",
+                    body=body,
+                    findings=kept,
+                    remedy="call again with severity='high' or 'medium' to narrow",
+                )
+                if every:
+                    columns_hit = len({f.column for f in every if f.column})
+                    response.summary = f"{len(every)} issue(s) across {columns_hit} column(s)."
+                else:
+                    response.summary = "No issues found."
+
+                record["issues"] = len(every)
+                record["returned"] = len(kept)
                 return response.build()
         except EDAError as exc:
             return exc.to_dict()

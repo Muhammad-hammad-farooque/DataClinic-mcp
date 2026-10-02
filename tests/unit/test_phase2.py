@@ -20,6 +20,7 @@ from eda_mcp.config import Settings, load_settings
 from eda_mcp.digest import compact, estimate_tokens
 from eda_mcp.errors import ColumnNotFoundError
 from eda_mcp.issues import column_findings
+from eda_mcp.issues import find_issues as detect_issues
 from eda_mcp.loaders import load_file
 from eda_mcp.profiling import (
     ColumnKind,
@@ -259,7 +260,7 @@ def test_stray_negatives_and_skew_are_flagged(messy: pd.DataFrame) -> None:
 
 
 def test_numbers_stored_as_text_are_flagged() -> None:
-    text = pd.Series(["1", "2", "3.5", "4,000"] * 30 + ["n/a"], name="t")
+    text = pd.Series(["1", "2", "3.5", "4,000"] * 30 + ["abc"], name="t")
     found = column_findings(profile_column(text, ColumnKind.TEXT))
     assert [f.message for f in found] == ["numbers stored as text"]
     assert found[0].affected_rows == 1
@@ -363,3 +364,149 @@ def test_profile_identical_on_sorted_copy(settings: Settings) -> None:
 )
 def test_profile_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
     assert call(server, "profile", args)["error"]["code"] == code
+
+
+# --------------------------------------------------------------------------
+# find_issues: raw-value and cross-column checks
+
+
+def issues_of(df: pd.DataFrame) -> list[str]:
+    kinds = column_kinds(df)
+    return [f.render() for f in detect_issues(df, kinds, profile_frame(df, kinds, now=NOW))]
+
+
+def test_missingness_tied_to_a_numeric_column_gets_a_flag() -> None:
+    rng = np.random.default_rng(1)
+    age = rng.uniform(20, 80, 2000)
+    income = pd.Series(rng.normal(50, 10, 2000))
+    income[(age > 60) & (rng.random(2000) < 0.3)] = np.nan  # older people skip it
+    lines = issues_of(pd.DataFrame({"age": age, "income": income}))
+    hit = [line for line in lines if line.startswith("MED  income:")]
+    assert hit and "age is higher" in hit[0] and "missingness flag" in hit[0]
+
+
+def test_missingness_tied_to_a_category_names_the_group() -> None:
+    rng = np.random.default_rng(2)
+    region = pd.Series(rng.choice(["north", "south", "east"], 3000))
+    score = pd.Series(rng.normal(0, 1, 3000))
+    score[(region == "east") & (rng.random(3000) < 0.5)] = np.nan
+    lines = issues_of(pd.DataFrame({"region": region, "score": score}))
+    assert any("concentrated where region=east" in line for line in lines)
+
+
+def test_random_missingness_is_not_called_related() -> None:
+    rng = np.random.default_rng(3)
+    df = pd.DataFrame(
+        {
+            "a": rng.normal(0, 1, 3000),
+            "b": rng.normal(0, 1, 3000),
+            "g": rng.choice(["x", "y", "z"], 3000),
+        }
+    )
+    df.loc[rng.random(3000) < 0.3, "b"] = np.nan
+    assert not any("where" in line for line in issues_of(df))
+
+
+def test_placeholder_codes_are_flagged_once() -> None:
+    values = pd.Series(np.r_[np.linspace(1, 100, 500), [-999] * 20], name="v")
+    lines = issues_of(values.to_frame())
+    assert any("placeholder code(s) -999" in line for line in lines)
+    assert not any("negative" in line for line in lines)  # same rows, not reported twice
+
+
+def test_minus_one_is_a_code_only_when_it_is_the_only_negative() -> None:
+    coded = pd.Series(np.r_[np.arange(1, 300), [-1] * 10], name="v").to_frame()
+    signed = pd.Series(np.r_[np.arange(-50, 250), [-1] * 10], name="v").to_frame()
+    assert any("placeholder code(s) -1" in line for line in issues_of(coded))
+    assert not any("placeholder" in line for line in issues_of(signed))
+
+
+def test_legitimate_99_is_not_a_placeholder() -> None:
+    ages = pd.Series(np.arange(18, 100).repeat(5), name="age").to_frame()
+    assert not any("placeholder" in line for line in issues_of(ages))
+
+
+def test_text_null_markers_left_by_non_csv_formats() -> None:
+    city = pd.Series(["Paris", "Rome", "N/A", "Oslo", "unknown"] * 40, name="city")
+    lines = issues_of(city.to_frame())
+    assert any("null placeholders" in line and "(80 rows)" in line for line in lines)
+
+
+def test_dates_stored_as_text() -> None:
+    dates = pd.Series([f"2024-03-{d:02d}" for d in range(1, 29)] * 5 + ["soon"] * 5, name="d")
+    words = pd.Series(["May", "June", "today"] * 50, name="w")
+    lines = issues_of(pd.DataFrame({"d": dates, "w": words}))
+    assert any(line.startswith("MED  d: dates stored as text") for line in lines)
+    assert not any(line.startswith("MED  w: dates") for line in lines)
+
+
+def test_identical_columns_and_rekeyed_records() -> None:
+    rng = np.random.default_rng(4)
+    base = pd.DataFrame({"x": rng.normal(0, 1, 200), "label": rng.choice(["a", "b"], 200)})
+    base["x_copy"] = base["x"]
+    df = pd.concat([base, base.head(10)], ignore_index=True)
+    df.insert(0, "row_id", np.arange(len(df)))  # a fresh key hides the repeats
+    lines = issues_of(df)
+    assert any("x_copy: identical to x" in line for line in lines)
+    assert any("repeat apart from their identifier (row_id)" in line for line in lines)
+    assert not any("exact duplicates" in line for line in lines)
+
+
+# --------------------------------------------------------------------------
+# find_issues tool
+
+
+def test_find_issues_is_registered_read_only(server) -> None:  # type: ignore[no-untyped-def]
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+    assert tools["find_issues"].annotations.read_only_hint is True
+
+
+def test_find_issues_ranks_and_ships_fixes(server) -> None:  # type: ignore[no-untyped-def]
+    payload = call(server, "find_issues", {"source": "m"})
+    findings = payload["findings"]
+    assert findings[0].startswith("HIGH") and all("->" in f for f in findings)
+    assert payload["counts"]["HIGH"] == 2
+    assert estimate_tokens(payload) <= 1200 * 1.15
+
+
+def test_find_issues_severity_filter(server) -> None:  # type: ignore[no-untyped-def]
+    every = call(server, "find_issues", {"source": "m"})
+    high = call(server, "find_issues", {"source": "m", "severity": "high"})
+    assert all(f.startswith("HIGH") for f in high["findings"])
+    assert high["counts"] == every["counts"]  # counts always describe the whole table
+
+
+def test_find_issues_identical_on_sorted_copy(settings: Settings) -> None:
+    srv = build_server(settings)
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "a"})
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy_sorted.csv"), "alias": "b"})
+    a = call(srv, "find_issues", {"source": "a"})
+    b = call(srv, "find_issues", {"source": "b"})
+    assert a["findings"] == b["findings"]
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"source": "m", "severity": "critical"}, "INVALID_OPERATION"),
+        ({"source": "nope"}, "SOURCE_NOT_FOUND"),
+    ],
+)
+def test_find_issues_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(server, "find_issues", args)["error"]["code"] == code
+
+
+def test_vectorised_missingness_correlation_matches_pandas(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    from eda_mcp import issues
+
+    rng = np.random.default_rng(5)
+    n = 5000
+    df = pd.DataFrame({"a": rng.normal(0, 1, n), "b": rng.exponential(1, n)})
+    df.loc[rng.random(n) < 0.1, "a"] = np.nan  # pairwise deletion must be honoured
+    flag = pd.Series(((df["b"] > 1.5) & (rng.random(n) < 0.6)).astype(float))
+    monkeypatch.setattr(issues, "RELATION_EFFECT", 0.0)
+    monkeypatch.setattr(issues, "RELATION_P", 1.0)
+
+    for column in ("a", "b"):
+        strength, _ = issues._numeric_relations(df, [column], {"t": flag.to_numpy()})["t"]
+        assert strength == pytest.approx(abs(df[column].corr(flag)), rel=1e-9)

@@ -28,6 +28,7 @@ from scipy import stats as scipy_stats
 
 from eda_mcp.digest import Finding, Severity, round_sig
 from eda_mcp.errors import ColumnNotFoundError
+from eda_mcp.loaders import NA_VALUES
 
 # A column with almost no repetition is a key, not a feature; one with almost
 # no variation carries no signal. Both are reported rather than analysed.
@@ -42,6 +43,17 @@ MODIFIED_Z_CUTOFF = 3.5
 RARE_SHARE = 0.01
 TOP_VALUES = 5
 EARLIEST_PLAUSIBLE = pd.Timestamp("1900-01-01")
+
+# Codes that data-entry systems use for "no value". Counted, not judged:
+# whether a 99 is a code or a real value is for ``issues`` to decide. 0 is
+# left out; zeros are far more often real than placeholders.
+SENTINELS = (-9999, -999, -99, -1, 99, 999, 9999, 99999)
+# Null markers the loader removes from CSV and Excel; Parquet and JSON keep them.
+PLACEHOLDERS = frozenset(v.strip().casefold() for v in NA_VALUES) - {""}
+# Parsing dates is slow per value, so only text that is mostly digit-bearing
+# is tried, and only its most frequent distinct values.
+DATE_GATE = 0.9
+DATE_PROBE_VALUES = 5_000
 
 
 class ColumnKind(StrEnum):
@@ -124,6 +136,24 @@ def _near_unique(series: pd.Series) -> bool:
     return len(non_null) > 0 and non_null.nunique() / len(non_null) >= 0.5
 
 
+def duplicated(df: pd.DataFrame, subset: list[Any] | None = None) -> pd.Series:
+    """Exact duplicate-row mask, as ``DataFrame.duplicated``, about 4x faster.
+
+    Rows are hashed to one 64-bit value each; only rows whose hash repeats are
+    compared in full, so the answer stays exact while the expensive
+    multi-column comparison runs on a handful of rows instead of all of them.
+    """
+    frame = df if subset is None else df[subset]
+    mask = pd.Series(False, index=df.index)
+    if frame.empty or frame.shape[1] == 0:
+        return mask
+    hashes = pd.util.hash_pandas_object(frame, index=False)
+    candidates = hashes.duplicated(keep=False).to_numpy()
+    if candidates.any():
+        mask[candidates] = frame[candidates].duplicated().to_numpy()
+    return mask
+
+
 def column_kinds(df: pd.DataFrame) -> dict[str, ColumnKind]:
     """Classify every column, judging uniqueness on distinct rows.
 
@@ -146,7 +176,7 @@ def column_kinds(df: pd.DataFrame) -> dict[str, ColumnKind]:
         and _near_unique(df[c])
     ]
     if suspects:
-        repeated = df.duplicated()
+        repeated = duplicated(df)
         if repeated.any():
             distinct = df[~repeated]
             kinds.update({str(c): classify(distinct[c]) for c in suspects})
@@ -160,7 +190,7 @@ def orientation(
     rows, cols = df.shape
     missing_by_column = df.isna().sum()
     total_cells = rows * cols
-    duplicates = int(df.duplicated().sum())
+    duplicates = int(duplicated(df).sum())
 
     body: dict[str, Any] = {
         "shape": [int(rows), int(cols)],
@@ -363,6 +393,15 @@ def numeric_stats(non_null: pd.Series) -> dict[str, Any]:
         "integral": bool(np.all(np.mod(ordered, 1) == 0)),
     }
 
+    codes = np.asarray(SENTINELS, dtype="float64")
+    present = np.searchsorted(ordered, codes, side="right") - np.searchsorted(
+        ordered, codes, side="left"
+    )
+    if present.any():
+        stats["sentinels"] = {
+            int(code): int(count) for code, count in zip(SENTINELS, present, strict=True) if count
+        }
+
     # A zero spread makes both fences meaningless: every value off the median
     # would be "an outlier". Report nothing rather than something misleading.
     if iqr > 0:
@@ -452,7 +491,34 @@ def string_checks(counts: pd.Series) -> dict[str, Any]:
 
     numeric = pd.to_numeric(text.str.replace(",", "", regex=False), errors="coerce")
     stats["numeric_like"] = int(weights[numeric.notna().to_numpy()].sum())
+
+    marker = stripped.str.casefold().isin(PLACEHOLDERS).to_numpy()
+    if marker.any():
+        stats["placeholders"] = int(weights[marker].sum())
+        stats["placeholder_values"] = [str(v) for v in text[marker].head(3)]
+
+    # Bare numbers parse as dates too ("12" -> the 12th), so text that is
+    # mostly numeric is numbers stored as text, not dates.
+    if stats["numeric_like"] < 0.5 * weights.sum():
+        date_like = _date_like(text, weights)
+        if date_like:
+            stats["date_like"] = date_like
     return stats
+
+
+def _date_like(text: pd.Series, weights: np.ndarray[Any, Any]) -> int:
+    """Rows whose value parses as a date, judged on the most frequent values.
+
+    Returns 0 without parsing unless nearly every row carries a digit -- a
+    date always does, and the check keeps "May" and "today" from counting.
+    """
+    has_digit = text.str.contains(r"\d", regex=True).to_numpy()
+    if weights[has_digit].sum() < DATE_GATE * weights.sum():
+        return 0
+    order = np.argsort(-weights, kind="stable")[:DATE_PROBE_VALUES]
+    probe = order[has_digit[order]]
+    parsed = pd.to_datetime(text.iloc[probe], errors="coerce", format="mixed")
+    return int(weights[probe][parsed.notna().to_numpy()].sum())
 
 
 def spelling_variants(counts: pd.Series) -> dict[str, Any]:

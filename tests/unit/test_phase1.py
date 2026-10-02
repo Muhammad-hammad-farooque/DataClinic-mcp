@@ -328,7 +328,7 @@ def test_default_alias_from_path() -> None:
 def test_tools_registered_with_annotations(settings: Settings) -> None:
     server = build_server(settings)
     tools = {t.name: t for t in asyncio.run(server.list_tools())}
-    assert set(tools) == {"load_dataset", "manage_sources", "profile"}
+    assert set(tools) == {"find_issues", "load_dataset", "manage_sources", "profile"}
     assert tools["load_dataset"].annotations.read_only_hint is True
     assert tools["manage_sources"].annotations.read_only_hint is False
 
