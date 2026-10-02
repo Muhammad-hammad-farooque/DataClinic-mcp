@@ -28,8 +28,12 @@ MISSING_HIGH = 0.6
 MISSING_MEDIUM = 0.2
 MISSING_LOW = 0.05
 
-# |skew| above 1 is the conventional line for "strongly skewed" (A.7).
+# |skew| above 1 is the conventional line for "strongly skewed" (A.7); below
+# 0.5 a distribution is close enough to symmetric.
 SKEW_LIMIT = 1.0
+SKEW_RESOLVED = 0.5
+# Simplest first: parameter-free transforms before fitted ones.
+TRANSFORM_PREFERENCE = ("log1p", "sqrt", "square", "boxcox", "yeojohnson")
 # Outliers below this share are ordinary tails, not worth a finding alone.
 OUTLIER_SHARE = 0.01
 # Negatives in an otherwise non-negative column are suspect only while rare;
@@ -53,6 +57,10 @@ RELATION_P = 0.01
 RELATION_MIN_ROWS = 30
 # Cells per block when scanning numeric columns, bounding peak memory.
 RELATION_BLOCK_CELLS = 8_000_000
+
+# One-hot stays reasonable up to about this many levels.
+ONE_HOT_LEVELS = 15
+SHORT_LABEL_CHARS = 30
 
 
 def _missing(profile: ColumnProfile, relation: str | None) -> Finding | None:
@@ -120,6 +128,18 @@ def _sentinels(profile: ColumnProfile) -> tuple[Finding | None, int]:
     return finding, sum(c for v, c in codes.items() if v < 0)
 
 
+def _simplest_transform(transforms: dict[str, float]) -> str:
+    """The simplest transform that removes the skew, else the most effective.
+
+    Measured, not assumed. A log needs no fitted parameter to store and
+    reapply, so it beats a Box-Cox that is only marginally more symmetric.
+    """
+    for name in TRANSFORM_PREFERENCE:
+        if name in transforms and abs(transforms[name]) < SKEW_RESOLVED:
+            return name
+    return min(transforms, key=lambda t: (abs(transforms[t]), t))
+
+
 def _numeric(profile: ColumnProfile) -> list[Finding]:
     stats, name, n = profile.stats, profile.name, profile.count
     findings: list[Finding] = []
@@ -149,7 +169,12 @@ def _numeric(profile: ColumnProfile) -> list[Finding]:
         message = f"{direction}-skewed ({skew:.2g})"
         if outliers:
             message += f", {outliers:,} outliers beyond 1.5 IQR"
-        if skew > 0 and stats.get("min", -1) >= 0:
+        transforms = stats.get("transforms")
+        if transforms:
+            best = _simplest_transform(transforms)
+            after = round(transforms[best], 2) + 0.0  # + 0.0 turns -0.0 into 0.0
+            advice = f"apply {best} (skew {skew:.2g} -> {after:.2f})"
+        elif skew > 0 and stats.get("min", -1) >= 0:
             advice = "apply log1p before modelling"
         else:
             advice = "use robust scaling (median/IQR)"
@@ -570,6 +595,25 @@ def find_issues(
     return findings
 
 
+def encoding_advice(profile: ColumnProfile) -> str | None:
+    """How to turn a categorical column into model features (A.7, A.19)."""
+    levels = profile.unique or 0
+    if profile.kind is ColumnKind.BOOLEAN or (
+        profile.kind is ColumnKind.CATEGORICAL and levels <= 2
+    ):
+        return "binary 0/1"
+    if profile.kind is ColumnKind.CATEGORICAL:
+        if levels <= ONE_HOT_LEVELS:
+            return f"one-hot ({levels} columns)"
+        return f"frequency or target encoding; one-hot would add {levels} columns"
+    if profile.kind is ColumnKind.TEXT:
+        # Short repeated labels are a high-cardinality category; long ones are prose.
+        if profile.stats.get("length", {}).get("median", 0) <= SHORT_LABEL_CHARS:
+            return f"frequency or target encoding; one-hot would add {levels} columns"
+        return "free text: derive features (length, keywords) or embed; do not one-hot"
+    return None
+
+
 def needs_attention(findings: list[Finding]) -> bool:
     """True when any finding is serious enough to show the column in full."""
     return any(f.severity in (Severity.HIGH, Severity.MEDIUM) for f in findings)
@@ -577,6 +621,7 @@ def needs_attention(findings: list[Finding]) -> bool:
 
 __all__ = [
     "column_findings",
+    "encoding_advice",
     "find_issues",
     "frame_findings",
     "missingness_relations",

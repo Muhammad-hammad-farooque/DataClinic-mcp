@@ -328,9 +328,20 @@ def test_default_alias_from_path() -> None:
 def test_tools_registered_with_annotations(settings: Settings) -> None:
     server = build_server(settings)
     tools = {t.name: t for t in asyncio.run(server.list_tools())}
-    assert set(tools) == {"find_issues", "load_dataset", "manage_sources", "profile"}
-    assert tools["load_dataset"].annotations.read_only_hint is True
-    assert tools["manage_sources"].annotations.read_only_hint is False
+    # (readOnly, openWorld) per tool, as tabled in spec section 7.7
+    expected = {
+        "load_dataset": (True, True),
+        "manage_sources": (False, None),
+        "profile": (True, True),
+        "find_issues": (True, False),
+        "analyze_column": (True, False),
+    }
+    assert set(tools) == set(expected)
+    for name, (read_only, open_world) in expected.items():
+        hints = tools[name].annotations
+        assert hints.read_only_hint is read_only, name
+        if open_world is not None:
+            assert hints.open_world_hint is open_world, name
 
 
 def test_load_dataset_returns_findings_not_just_shape(settings: Settings) -> None:

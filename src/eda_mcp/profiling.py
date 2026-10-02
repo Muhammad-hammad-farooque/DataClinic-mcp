@@ -528,15 +528,22 @@ def spelling_variants(counts: pd.Series) -> dict[str, Any]:
     pandas, one to anyone reading the data. Takes value counts, so the cost
     tracks cardinality rather than row count.
     """
-    counts = _rank(counts.groupby(counts.index.map(str)).sum())
+    merged = counts.groupby(counts.index.map(str)).sum()
+    keys = pd.Series(merged.index, dtype="string").str.casefold()
+    keys = keys.str.replace(r"[\W_]+", "", regex=True)
+    # Only values sharing a key can be variants. On a high-cardinality column
+    # that is a handful of the distinct values, so rank and group just those.
+    shared = (keys.duplicated(keep=False) & (keys != "")).to_numpy()
+    if not shared.any():
+        return {}
+    key_of = dict(zip(merged.index[shared], keys[shared], strict=True))
+    counts = _rank(merged[shared])
     raw = pd.Series(counts.index, dtype="string")
-    keys = raw.str.casefold().str.replace(r"[\W_]+", "", regex=True)
+    keys = raw.map(key_of)
 
     groups: list[list[str]] = []
     affected = 0
-    for key, members in raw.groupby(keys.to_numpy(), sort=False):
-        if not key or len(members) < 2:
-            continue
+    for _, members in raw.groupby(keys.to_numpy(), sort=False):
         # members keep the frequency order of counts, so the first is dominant
         names = [str(m) for m in members]
         groups.append(names)
@@ -659,3 +666,233 @@ def profile_frame(
     return [
         profile_column(df[labels[name]].rename(name), kinds.get(name), now) for name in selected
     ]
+
+
+# --------------------------------------------------------------------------
+# single-column detail, for analyze_column
+#
+# Everything here deepens one column's profile. It is too costly or too long
+# to compute for every column in ``profile``, and cheap for just one.
+
+HISTOGRAM_BINS = 10
+# Order statistics used to fit a power transform's lambda.
+LAMBDA_PROBE = 20_000
+DETAIL_VALUES = 15
+DETAIL_RARE = 10
+DETAIL_TEXT_CHARS = 40
+MAX_YEARS = 20
+KEY_SHAPE = str.maketrans(
+    "0123456789" + "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "9" * 10 + "A" * 52,
+)
+EMAIL = r"^[\w.+-]+@[\w-]+\.[\w.-]+$"
+URL = r"^https?://"
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= DETAIL_TEXT_CHARS else text[: DETAIL_TEXT_CHARS - 1] + "…"
+
+
+def _skew(values: np.ndarray[Any, Any]) -> float | None:
+    with np.errstate(all="ignore"):
+        if not np.all(np.isfinite(values)) or values.min() == values.max():
+            return None
+        result = float(scipy_stats.skew(values, bias=False))
+    return result if np.isfinite(result) else None
+
+
+def transform_skews(ordered: np.ndarray[Any, np.dtype[np.float64]]) -> dict[str, float]:
+    """Skew left after each transform that applies to these values (A.16).
+
+    Only transforms valid for the column's range are tried: logs and roots
+    need non-negative values, Box-Cox needs positive ones, squaring only
+    helps a left skew. Yeo-Johnson accepts anything.
+
+    The power transforms' lambda is fitted on evenly spaced order statistics
+    rather than every row: fitting is an iterative search over the data, and
+    the order statistics trace the whole distribution, so lambda barely moves
+    (skew within 0.002 in testing) at a thirtieth of the cost. The fitted
+    transform is then applied to, and its skew measured on, every row.
+    """
+    lo = float(ordered[0])
+    base = _skew(ordered)
+    probe = ordered[np.linspace(0, len(ordered) - 1, min(len(ordered), LAMBDA_PROBE)).astype(int)]
+
+    candidates: dict[str, Any] = {}
+    if lo >= 0:
+        candidates["log1p"] = np.log1p
+        candidates["sqrt"] = np.sqrt
+    if lo > 0:
+        candidates["boxcox"] = lambda v: scipy_stats.boxcox(v, scipy_stats.boxcox(probe)[1])
+    candidates["yeojohnson"] = lambda v: scipy_stats.yeojohnson(v, scipy_stats.yeojohnson(probe)[1])
+    if base is not None and base < 0:
+        candidates["square"] = np.square
+
+    out: dict[str, float] = {}
+    for name, transform in candidates.items():
+        try:
+            # Fitting and applying both happen here, so either failing just
+            # drops that transform from the options.
+            with np.errstate(all="ignore"):
+                skew = _skew(np.asarray(transform(ordered), dtype="float64"))
+        except (ValueError, FloatingPointError, OverflowError):
+            continue  # a transform that cannot be fitted is simply not an option
+        if skew is not None:
+            out[name] = skew
+    return out
+
+
+def numeric_detail(non_null: pd.Series, stats: dict[str, Any]) -> dict[str, Any]:
+    ordered = np.sort(non_null.to_numpy(dtype="float64"))
+    n = len(ordered)
+    detail: dict[str, Any] = {
+        "percentiles": {f"p{p}": _quantile(ordered, p / 100) for p in (1, 5, 95, 99)},
+    }
+
+    # Run lengths of the sorted values give the mode without hashing.
+    starts = np.flatnonzero(np.r_[True, np.diff(ordered) != 0])
+    runs = np.diff(np.r_[starts, n])
+    top = int(np.argmax(runs))
+    if runs[top] > 1:
+        detail["mode"] = float(ordered[starts[top]])
+        detail["mode_count"] = int(runs[top])
+
+    std, mean = stats.get("std"), stats["mean"]
+    if std:
+        detail["outliers_z"] = int(np.count_nonzero(np.abs(ordered - mean) / std > 3))
+        if mean:
+            detail["cv"] = std / abs(mean)
+
+    if ordered[0] != ordered[-1]:
+        counts, edges = np.histogram(ordered, bins=HISTOGRAM_BINS)
+        detail["histogram"] = {
+            "from": float(edges[0]),
+            "to": float(edges[-1]),
+            "counts": counts.tolist(),
+        }
+        if n >= 20:
+            # On large samples this rejects any tiny departure; skew and
+            # kurtosis say how far from normal, this says whether at all.
+            detail["normal_p"] = float(scipy_stats.normaltest(ordered).pvalue)
+        transforms = transform_skews(ordered)
+        if transforms:
+            detail["transforms"] = transforms
+    return detail
+
+
+def datetime_detail(non_null: pd.Series, stats: dict[str, Any]) -> dict[str, Any]:
+    parts = non_null.dt
+    detail: dict[str, Any] = {}
+
+    years = parts.year.value_counts().sort_index()
+    if len(years) <= MAX_YEARS:
+        detail["by_year"] = {int(k): int(v) for k, v in years.items()}
+    months = parts.month.value_counts()
+    detail["by_month"] = [int(months.get(m, 0)) for m in range(1, 13)]
+    weekdays = parts.dayofweek.value_counts()
+    detail["by_weekday"] = [int(weekdays.get(d, 0)) for d in range(7)]
+
+    days = parts.normalize()
+    if not (non_null == days).all():
+        hours = parts.hour.value_counts()
+        detail["by_hour"] = [int(hours.get(h, 0)) for h in range(24)]
+
+    # A daily series should have every day between its ends.
+    if stats.get("median_gap_days") == 1:
+        present = days.nunique()
+        expected = int((days.max() - days.min()) / pd.Timedelta(days=1)) + 1
+        detail["missing_days"] = expected - int(present)
+    return detail
+
+
+def _value_list(counts: pd.Series, limit: int) -> dict[str, int]:
+    return {_clip(str(k)): int(v) for k, v in counts.head(limit).items()}
+
+
+def categorical_detail(non_null: pd.Series, stats: dict[str, Any]) -> dict[str, Any]:
+    counts = _ranked_counts(non_null)
+    detail: dict[str, Any] = {
+        "values": _value_list(counts, DETAIL_VALUES),
+        "cardinality_ratio": len(counts) / len(non_null),
+    }
+    rare = counts[counts / len(non_null) < RARE_SHARE]
+    if len(rare):
+        detail["rare_values"] = [_clip(str(v)) for v in rare.index[:DETAIL_RARE]]
+    return detail
+
+
+def text_detail(non_null: pd.Series, stats: dict[str, Any]) -> dict[str, Any]:
+    counts = _ranked_counts(non_null)
+    text = pd.Series(counts.index.map(str), dtype=object)
+    weights = counts.to_numpy()
+    words = text.str.count(r"\S+").to_numpy()
+    return {
+        "values": _value_list(counts, 10),
+        "words": {
+            "median": float(np.median(np.repeat(words, weights))),
+            "max": int(words.max()),
+        },
+        "with_digits": int(weights[text.str.contains(r"\d", regex=True).to_numpy()].sum()),
+        "emails": int(weights[text.str.match(EMAIL).to_numpy()].sum()),
+        "urls": int(weights[text.str.match(URL).to_numpy()].sum()),
+    }
+
+
+def identifier_detail(non_null: pd.Series, stats: dict[str, Any]) -> dict[str, Any]:
+    text = non_null.astype(str)
+    # The shape of a key -- CUST000123 -> AAAA999999 -- shows malformed entries
+    # that no statistic would. A translation table is several times faster
+    # than a regex; the regex is kept only for non-ASCII letters.
+    shapes = text.str.translate(KEY_SHAPE)
+    if not shapes.str.isascii().all():
+        shapes = shapes.str.replace(r"[^\W\d_]", "A", regex=True)
+    detail: dict[str, Any] = {"patterns": _value_list(_ranked_counts(shapes), 3)}
+
+    # Rank only the repeats: ordering a million unique keys to find a few
+    # duplicates would cost far more than finding them.
+    counts = non_null.value_counts()
+    repeated = counts[counts > 1]
+    if len(repeated):
+        detail["repeated"] = _value_list(_rank(repeated), TOP_VALUES)
+    return detail
+
+
+def constant_detail(non_null: pd.Series, stats: dict[str, Any]) -> dict[str, Any]:
+    counts = _ranked_counts(non_null)
+    if len(counts) < 2:
+        return {}
+    return {"others": _value_list(counts.iloc[1:], TOP_VALUES)}
+
+
+def column_detail(non_null: pd.Series, kind: ColumnKind, stats: dict[str, Any]) -> dict[str, Any]:
+    """The extra statistics ``analyze_column`` adds to a column's profile."""
+    if non_null.empty:
+        return {}
+    if kind is ColumnKind.NUMERIC:
+        return numeric_detail(non_null, stats)
+    if kind is ColumnKind.DATETIME:
+        return datetime_detail(non_null, stats)
+    if kind in (ColumnKind.CATEGORICAL, ColumnKind.BOOLEAN):
+        return categorical_detail(non_null, stats)
+    if kind is ColumnKind.TEXT:
+        return text_detail(non_null, stats)
+    if kind is ColumnKind.IDENTIFIER:
+        return identifier_detail(non_null, stats)
+    return constant_detail(non_null, stats)
+
+
+def analyze_column(
+    series: pd.Series, kind: ColumnKind, now: pd.Timestamp | None = None
+) -> ColumnProfile:
+    """A column's profile with its detail statistics merged in."""
+    profile = profile_column(series, kind, now)
+    if profile.error:
+        return profile
+    try:
+        profile.stats.update(column_detail(series.dropna(), kind, profile.stats))
+        if "values" in profile.stats:
+            profile.stats.pop("top", None)  # the full value list supersedes it
+    except Exception as exc:
+        # The base profile is still sound and worth returning; say what is absent.
+        profile.stats["detail_failed"] = f"{type(exc).__name__} while computing detail"
+    return profile

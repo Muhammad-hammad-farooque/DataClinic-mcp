@@ -32,6 +32,7 @@ from eda_mcp.profiling import (
     spelling_variants,
     string_checks,
 )
+from eda_mcp.profiling import analyze_column as deep_profile
 from eda_mcp.server import build_server
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -510,3 +511,102 @@ def test_vectorised_missingness_correlation_matches_pandas(monkeypatch) -> None:
     for column in ("a", "b"):
         strength, _ = issues._numeric_relations(df, [column], {"t": flag.to_numpy()})["t"]
         assert strength == pytest.approx(abs(df[column].corr(flag)), rel=1e-9)
+
+
+# --------------------------------------------------------------------------
+# analyze_column
+
+
+def test_simplest_sufficient_transform_wins() -> None:
+    from eda_mcp.issues import _simplest_transform
+
+    assert _simplest_transform({"log1p": 0.3, "boxcox": 0.0}) == "log1p"
+    assert _simplest_transform({"log1p": 0.9, "boxcox": 0.01}) == "boxcox"
+    assert _simplest_transform({"log1p": 0.9, "yeojohnson": -0.7}) == "yeojohnson"
+
+
+def test_numeric_detail_matches_numpy(messy: pd.DataFrame) -> None:
+    price = messy["price"]
+    stats = deep_profile(price, ColumnKind.NUMERIC).stats
+    assert stats["percentiles"]["p99"] == pytest.approx(np.percentile(price, 99))
+    assert sum(stats["histogram"]["counts"]) == len(price)
+    assert stats["mode_count"] == int(price.value_counts().max())
+
+
+def test_transform_advice_names_the_simplest_that_works(messy: pd.DataFrame) -> None:
+    profile = deep_profile(messy["price"], ColumnKind.NUMERIC)
+    advice = [f.recommendation for f in column_findings(profile) if "skewed" in f.message]
+    assert advice == [advice[0]] and advice[0].startswith("apply log1p (skew 3.9 -> 0.14)")
+
+
+def test_left_skew_is_offered_square() -> None:
+    values = pd.Series(100 - np.random.default_rng(6).lognormal(0, 0.8, 2000), name="v")
+    assert "square" in deep_profile(values, ColumnKind.NUMERIC).stats["transforms"]
+
+
+def test_text_detail_counts_contacts() -> None:
+    notes = pd.Series(
+        ["call me at a@b.com", "https://x.org/page", "plain words here", "a@b.com"] * 20,
+        name="notes",
+    )
+    stats = deep_profile(notes, ColumnKind.TEXT).stats
+    # values that are contacts count; prose that mentions one does not
+    assert stats["emails"] == 20 and stats["urls"] == 20
+    assert stats["words"]["max"] == 4
+
+
+def test_failed_detail_keeps_the_base_profile(monkeypatch, messy: pd.DataFrame) -> None:  # type: ignore[no-untyped-def]
+    from eda_mcp import profiling
+
+    def broken(*args, **kwargs):  # type: ignore[no-untyped-def]
+        raise ValueError("boom")
+
+    monkeypatch.setattr(profiling, "column_detail", broken)
+    profile = deep_profile(messy["price"], ColumnKind.NUMERIC)
+    assert profile.error is None and "mean" in profile.stats
+    assert "detail_failed" in profile.stats
+
+
+def test_analyze_column_adapts_to_type(server) -> None:  # type: ignore[no-untyped-def]
+    country = call(server, "analyze_column", {"source": "m", "column": "country"})
+    assert len(country["values"]) == 6 and "top" not in country
+    assert country["encoding"] == "one-hot (6 columns)"
+
+    dates = call(server, "analyze_column", {"source": "m", "column": "signup_date"})
+    assert sum(dates["by_month"]) == dates["count"]
+    assert dates["missing_days"] == 4
+
+    key = call(server, "analyze_column", {"source": "m", "column": "customer_id"})
+    assert key["patterns"] == {"AAAA999999": 5150}
+    assert len(key["repeated"]) == 5
+
+
+def test_analyze_column_stays_within_budget(server, messy: pd.DataFrame) -> None:  # type: ignore[no-untyped-def]
+    for column in messy.columns:
+        payload = call(server, "analyze_column", {"source": "m", "column": column})
+        assert "error" not in payload, column
+        assert estimate_tokens(payload) <= 600 * 1.15, column
+
+
+def test_analyze_column_identical_on_sorted_copy(settings: Settings, messy: pd.DataFrame) -> None:
+    srv = build_server(settings)
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "a"})
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy_sorted.csv"), "alias": "b"})
+    for column in messy.columns:
+        a = call(srv, "analyze_column", {"source": "a", "column": column})
+        b = call(srv, "analyze_column", {"source": "b", "column": column})
+        for payload in (a, b):
+            payload.pop("dataset")
+            payload.pop("sorted", None)  # genuinely a property of row order
+        assert a == b, column
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"source": "m", "column": "nope"}, "COLUMN_NOT_FOUND"),
+        ({"source": "nope", "column": "price"}, "SOURCE_NOT_FOUND"),
+    ],
+)
+def test_analyze_column_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(server, "analyze_column", args)["error"]["code"] == code

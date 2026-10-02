@@ -19,12 +19,19 @@ from mcp.types import ToolAnnotations
 from eda_mcp import __version__
 from eda_mcp.config import Settings, load_settings
 from eda_mcp.digest import BUDGETS, Finding, Response, Severity, fit
-from eda_mcp.errors import EDAError, ErrorCode, SourceTooLargeError
+from eda_mcp.errors import ColumnNotFoundError, EDAError, ErrorCode, SourceTooLargeError
 from eda_mcp.instructions import INSTRUCTIONS
-from eda_mcp.issues import column_findings, frame_findings, needs_attention
+from eda_mcp.issues import (
+    column_findings,
+    encoding_advice,
+    frame_findings,
+    missingness_relations,
+    needs_attention,
+)
 from eda_mcp.issues import find_issues as detect_issues
 from eda_mcp.loaders import load_file
 from eda_mcp.logging import configure, get_logger, new_correlation_id, tool_call
+from eda_mcp.profiling import analyze_column as deep_profile
 from eda_mcp.profiling import column_kinds, duplicated, orientation, profile_frame, summarise
 from eda_mcp.registry import Registry
 
@@ -34,6 +41,8 @@ from eda_mcp.registry import Registry
 READ_ONLY_EXTERNAL = ToolAnnotations(
     read_only_hint=True, idempotent_hint=True, open_world_hint=True
 )
+# In-memory analysis touches nothing outside the process (spec 7.7).
+READ_ONLY_LOCAL = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=False)
 MUTATING = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False)
 
 DETAIL_LEVELS = ("brief", "standard", "full")
@@ -248,7 +257,7 @@ def build_server(settings: Settings | None = None) -> MCPServer:
             "to other columns, identical columns, records repeated under new keys. "
             "severity is 'all', 'low', 'medium' or 'high' (the lowest level returned)."
         ),
-        annotations=READ_ONLY_EXTERNAL,
+        annotations=READ_ONLY_LOCAL,
     )
     def find_issues(source: str, severity: str = "all") -> dict[str, Any]:
         try:
@@ -288,6 +297,55 @@ def build_server(settings: Settings | None = None) -> MCPServer:
 
                 record["issues"] = len(every)
                 record["returned"] = len(kept)
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
+        name="analyze_column",
+        description=(
+            "Deep dive on one column, adapted to its type: percentiles, histogram, "
+            "normality and the best transform for numbers; full value list and encoding "
+            "advice for categories; calendar breakdown and gaps for dates; key formats "
+            "for identifiers. Includes the column's issues with fixes."
+        ),
+        annotations=READ_ONLY_LOCAL,
+    )
+    def analyze_column(source: str, column: str) -> dict[str, Any]:
+        try:
+            with tool_call("analyze_column", source=source, column=column) as record:
+                df = registry.get_dataset(source).df
+                labels = {str(c): c for c in df.columns}
+                if column not in labels:
+                    raise ColumnNotFoundError(column, list(labels))
+                # Classified with the whole frame, so the kind matches profile's.
+                kinds = column_kinds(df)
+                kind = kinds[column]
+                profile = deep_profile(df[labels[column]].rename(column), kind)
+
+                relation = None
+                if profile.missing:
+                    relation = missingness_relations(df, kinds, [column]).get(column)
+                findings = column_findings(profile, relation)
+
+                body: dict[str, Any] = {"dataset": source, "column": column}
+                body.update(profile.digest())
+                encoding = encoding_advice(profile)
+                if encoding:
+                    body["encoding"] = encoding
+
+                response = Response("analyze_column", body=body, findings=findings)
+                serious = sum(1 for f in findings if f.severity is not Severity.LOW)
+                response.summary = (
+                    f"{column}: {kind.value}, {profile.count:,} values"
+                    + (f", {profile.missing_pct:.0f}% missing" if profile.missing else "")
+                    + (f". {serious} issue(s) to fix." if serious else ". Nothing to fix.")
+                )
+
+                record["kind"] = kind.value
+                record["findings"] = len(findings)
                 return response.build()
         except EDAError as exc:
             return exc.to_dict()
