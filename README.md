@@ -4,9 +4,10 @@ An MCP server that lets an AI assistant run a full exploratory data analysis
 workflow — inspect a dataset, diagnose what is wrong with it, fix it, and write
 the result back out.
 
-> **Status: early alpha.** Phase 1 of 6 is complete. Two tools work today
-> (`load_dataset`, `manage_sources`). The analysis, cleaning and database tools
-> described in the roadmap are **not implemented yet**. See
+> **Status: early alpha.** Phase 1 of 6 is complete and Phase 2 is under way.
+> Three tools work today (`load_dataset`, `profile`, `manage_sources`). The
+> remaining analysis tools, cleaning and database support are **not implemented
+> yet**. See
 > [Current state](#current-state) for exactly what runs.
 
 ---
@@ -100,6 +101,7 @@ Restart the client and the tools appear.
 | Tool | What it does |
 |---|---|
 | `load_dataset` | Reads CSV, TSV, Excel, Parquet, JSON or NDJSON into the session and returns shape, column classifications, missing-data summary, duplicate count and ranked findings |
+| `profile` | Full-population statistics per column with ranked findings, each carrying one recommended fix. Problem columns are shown in full and clean ones rolled up into a line; `detail` is `brief`, `standard` or `full`, and `columns=` narrows to named columns |
 | `manage_sources` | Lists what is open in the session, or closes one to free memory |
 
 `load_dataset` returns a profile in its first response, so there is no need for
@@ -123,7 +125,7 @@ mistaken for a key.
 
 ### Not built yet
 
-`profile` · `analyze_column` · `find_issues` · `check_relationships` ·
+`analyze_column` · `find_issues` · `check_relationships` ·
 `analyze_target` · `query` · `validate_rules` · `clean_data` ·
 `transform_data` · `reshape_data` · `history` · `plot` · `generate` · `export`
 · database connectivity
@@ -229,7 +231,7 @@ contain values from your data.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Config, errors, logging, registry, loaders, budgeting, `load_dataset` | **done** |
-| 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | next |
+| 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | in progress (`profile` done) |
 | 3 | Database read path — PostgreSQL, MySQL, SQLite, DuckDB, push-down profiling | planned |
 | 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | planned |
 | 5 | `plot`, `generate`, `export`, MCP resources | planned |

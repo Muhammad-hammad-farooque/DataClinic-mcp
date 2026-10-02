@@ -304,6 +304,14 @@ class ColumnProfile:
             out["failed"] = self.error
         return out
 
+    def digest(self) -> dict[str, Any]:
+        """The response form: dtype and zero missingness are noise to the reader."""
+        out = self.to_dict()
+        del out["dtype"]
+        if not self.missing:
+            del out["missing"], out["missing_pct"]
+        return out
+
 
 def _rank(counts: pd.Series) -> pd.Series:
     """Order counts by frequency, ties broken by value, so row order cannot leak in."""

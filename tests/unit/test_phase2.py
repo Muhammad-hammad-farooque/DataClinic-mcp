@@ -6,6 +6,7 @@ on the full frame and must not depend on row order.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import numpy as np
@@ -16,8 +17,9 @@ from hypothesis import settings as hyp_settings
 from hypothesis import strategies as st
 
 from eda_mcp.config import Settings, load_settings
-from eda_mcp.digest import compact
+from eda_mcp.digest import compact, estimate_tokens
 from eda_mcp.errors import ColumnNotFoundError
+from eda_mcp.issues import column_findings
 from eda_mcp.loaders import load_file
 from eda_mcp.profiling import (
     ColumnKind,
@@ -29,6 +31,7 @@ from eda_mcp.profiling import (
     spelling_variants,
     string_checks,
 )
+from eda_mcp.server import build_server
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
 NOW = pd.Timestamp("2026-10-01")
@@ -231,3 +234,132 @@ def test_profiles_are_json_serialisable(profiles) -> None:  # type: ignore[no-un
     # strict: no default=str fallback, so a Timestamp would fail here
     json.dumps(compact(profiles))
     assert not [v for v in leaves(profiles) if isinstance(v, np.generic)]
+
+
+# --------------------------------------------------------------------------
+# issues
+
+
+def test_binary_flag_is_not_called_skewed() -> None:
+    flag = profile_column(pd.Series([0] * 95 + [1] * 5, name="f"), ColumnKind.NUMERIC)
+    assert not column_findings(flag)
+
+
+def test_signed_column_negatives_are_not_flagged() -> None:
+    signed = profile_column(pd.Series(np.linspace(-1, 1, 101), name="s"), ColumnKind.NUMERIC)
+    assert not any("negative" in f.message for f in column_findings(signed))
+
+
+def test_stray_negatives_and_skew_are_flagged(messy: pd.DataFrame) -> None:
+    by_name = {p.name: column_findings(p) for p in profile_frame(messy, column_kinds(messy))}
+    age = [f.render() for f in by_name["age"]]
+    price = [f.render() for f in by_name["price"]]
+    assert any("52 negative" in line for line in age)
+    assert any("right-skewed" in line and "log1p" in line for line in price)
+
+
+def test_numbers_stored_as_text_are_flagged() -> None:
+    text = pd.Series(["1", "2", "3.5", "4,000"] * 30 + ["n/a"], name="t")
+    found = column_findings(profile_column(text, ColumnKind.TEXT))
+    assert [f.message for f in found] == ["numbers stored as text"]
+    assert found[0].affected_rows == 1
+
+
+def test_future_dates_are_flagged() -> None:
+    dates = pd.Series(pd.to_datetime(["2020-01-01", "2021-01-01", "2030-01-01"]), name="d")
+    found = column_findings(profile_column(dates, ColumnKind.DATETIME, now=NOW))
+    assert found[0].affected_rows == 1 and "future" in found[0].message
+
+
+def test_every_finding_has_one_recommendation(messy: pd.DataFrame) -> None:
+    findings = [f for p in profile_frame(messy, column_kinds(messy)) for f in column_findings(p)]
+    assert findings and all(f.recommendation for f in findings)
+
+
+# --------------------------------------------------------------------------
+# profile tool
+
+
+def call(server, tool, args):  # type: ignore[no-untyped-def]
+    result = asyncio.run(server.call_tool(tool, args))
+    payload = result[1] if isinstance(result, tuple) else result
+    return payload.structured_content
+
+
+@pytest.fixture()
+def server(settings: Settings):  # type: ignore[no-untyped-def]
+    srv = build_server(settings)
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "m"})
+    return srv
+
+
+def test_profile_is_registered_read_only(server) -> None:  # type: ignore[no-untyped-def]
+    tools = {t.name: t for t in asyncio.run(server.list_tools())}
+    assert tools["profile"].annotations.read_only_hint is True
+
+
+def test_profile_shows_problem_columns_and_rolls_up_clean(server) -> None:  # type: ignore[no-untyped-def]
+    payload = call(server, "profile", {"source": "m"})
+    shown = set(payload["columns"])
+    assert {"price", "age", "country", "notes", "customer_id"} <= shown
+    assert "revenue" not in shown and "revenue" in payload["clean"]
+    # worst first: the HIGH columns lead
+    assert list(payload["columns"])[:2] == ["customer_id", "notes"]
+    assert payload["duplicate_rows"] == 150
+    assert any("exact duplicates" in f for f in payload["findings"])
+
+
+def test_profile_stays_within_budget(server) -> None:  # type: ignore[no-untyped-def]
+    for detail in ("brief", "standard", "full"):
+        payload = call(server, "profile", {"source": "m", "detail": detail})
+        assert estimate_tokens(payload) <= 1500 * 1.15, detail
+
+
+def test_profile_detail_levels(server) -> None:  # type: ignore[no-untyped-def]
+    brief = call(server, "profile", {"source": "m", "detail": "brief"})
+    assert "columns" not in brief and brief["findings"]
+    full = call(server, "profile", {"source": "m", "detail": "full"})
+    assert len(full["columns"]) == 10 and "more_columns" not in full
+    assert "clean" not in full
+
+
+def test_profile_column_subset(server) -> None:  # type: ignore[no-untyped-def]
+    payload = call(server, "profile", {"source": "m", "columns": ["revenue", "age"]})
+    assert set(payload["columns"]) == {"revenue", "age"}  # clean ones too: they were asked for
+    assert "duplicate_rows" not in payload
+    assert all(f.split()[1].rstrip(":") in {"revenue", "age"} for f in payload["findings"])
+
+
+def test_profile_wide_table_is_cut_to_budget(tmp_path: Path) -> None:
+    rng = np.random.default_rng(0)
+    wide = pd.DataFrame({f"c{i}": rng.lognormal(0, 1.5, 300) for i in range(120)})
+    wide.to_csv(tmp_path / "wide.csv", index=False)
+    srv = build_server(load_settings(log_level="WARNING", allowed_paths=[tmp_path]))
+    call(srv, "load_dataset", {"source": str(tmp_path / "wide.csv"), "alias": "w"})
+
+    payload = call(srv, "profile", {"source": "w"})
+    assert estimate_tokens(payload) <= 1500 * 1.15
+    assert "+" in payload["more_columns"]["omitted"]  # names capped, count stated
+    assert "columns=" in payload["more_columns"]["remedy"]
+
+
+def test_profile_identical_on_sorted_copy(settings: Settings) -> None:
+    srv = build_server(settings)
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "a"})
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy_sorted.csv"), "alias": "b"})
+    a = call(srv, "profile", {"source": "a"})
+    b = call(srv, "profile", {"source": "b"})
+    a.pop("dataset"), b.pop("dataset")
+    assert a == b
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"source": "m", "detail": "verbose"}, "INVALID_OPERATION"),
+        ({"source": "nope"}, "SOURCE_NOT_FOUND"),
+        ({"source": "m", "columns": ["nope"]}, "COLUMN_NOT_FOUND"),
+    ],
+)
+def test_profile_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(server, "profile", args)["error"]["code"] == code

@@ -104,6 +104,26 @@ def compact(obj: Any, digits: int = 3) -> Any:
     return obj
 
 
+def fit(items: dict[str, Any], budget: int) -> tuple[dict[str, Any], list[str]]:
+    """Keep entries in order until *budget* tokens are spent.
+
+    Whole entries only: a half-emitted column profile is worse than none.
+    The first entry is always kept so a tight budget still says something.
+    Returns the kept entries and the keys left out.
+    """
+    kept: dict[str, Any] = {}
+    spent = 0
+    keys = list(items)
+    for i, key in enumerate(keys):
+        value = compact(items[key])
+        cost = estimate_tokens({key: value})
+        if kept and spent + cost > budget:
+            return kept, keys[i:]
+        kept[key] = value
+        spent += cost
+    return kept, []
+
+
 @dataclass(slots=True)
 class Finding:
     """One observation about the data, rendered as a single line.
@@ -141,6 +161,7 @@ class Response:
     summary: str | None = None
     resources: list[str] = field(default_factory=list)
     sampled: dict[str, Any] | None = None
+    remedy: str = "call again with severity= to narrow, or read the full resource"
 
     def add(self, finding: Finding) -> None:
         self.findings.append(finding)
@@ -177,7 +198,7 @@ class Response:
             payload["truncated"] = {
                 "omitted": omitted,
                 "reason": "token_budget",
-                "remedy": "call again with severity= to narrow, or read the full resource",
+                "remedy": self.remedy,
             }
         if self.resources:
             payload["resources"] = self.resources
