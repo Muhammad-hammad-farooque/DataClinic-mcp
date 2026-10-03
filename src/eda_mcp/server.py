@@ -31,9 +31,24 @@ from eda_mcp.issues import (
 from eda_mcp.issues import find_issues as detect_issues
 from eda_mcp.loaders import load_file
 from eda_mcp.logging import configure, get_logger, new_correlation_id, tool_call
+from eda_mcp.profiling import (
+    ColumnKind,
+    column_kinds,
+    duplicated,
+    orientation,
+    profile_frame,
+    summarise,
+)
 from eda_mcp.profiling import analyze_column as deep_profile
-from eda_mcp.profiling import column_kinds, duplicated, orientation, profile_frame, summarise
 from eda_mcp.registry import Registry
+from eda_mcp.relations import (
+    MAX_GROUPS,
+    REPORT_STRENGTH,
+    all_pairs,
+    collinearity_findings,
+    compare_groups,
+    target_pairs,
+)
 
 # Behavioural hints let a client skip confirmation on safe calls. read_only
 # means no *source* is modified; destructive is reserved for export, the one
@@ -50,6 +65,14 @@ DETAIL_LEVELS = ("brief", "standard", "full")
 # a fixed share of the budget and findings absorb the rest.
 PROFILE_COLUMN_SHARE = 0.6
 ROLLUP_NAMES = 20
+# Kinds that can be related to others, and kinds that can split rows into groups.
+RELATABLE_KINDS = (
+    ColumnKind.NUMERIC,
+    ColumnKind.DATETIME,
+    ColumnKind.CATEGORICAL,
+    ColumnKind.BOOLEAN,
+)
+GROUPABLE_KINDS = (ColumnKind.CATEGORICAL, ColumnKind.BOOLEAN, ColumnKind.NUMERIC)
 # The lowest severity rank each find_issues filter keeps.
 SEVERITY_FLOORS = {
     "all": Severity.INFO.rank,
@@ -345,6 +368,90 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                 )
 
                 record["kind"] = kind.value
+                record["findings"] = len(findings)
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
+        name="check_relationships",
+        description=(
+            "Ranked relationships between columns -- never a full matrix. With no "
+            "arguments: strongest pairs of any type plus collinear groups to prune. "
+            "target= ranks every column's link to one column. group_by= compares every "
+            "column across the groups of a categorical column, with effect sizes."
+        ),
+        annotations=READ_ONLY_LOCAL,
+    )
+    def check_relationships(
+        source: str, target: str | None = None, group_by: str | None = None
+    ) -> dict[str, Any]:
+        try:
+            with tool_call(
+                "check_relationships", source=source, target=target, group_by=group_by
+            ) as record:
+                df = registry.get_dataset(source).df
+                labels = {str(c): c for c in df.columns}
+                for name in (target, group_by):
+                    if name is not None and name not in labels:
+                        raise ColumnNotFoundError(name, list(labels))
+                kinds = column_kinds(df)
+                body: dict[str, Any] = {"dataset": source, "shape": [*map(int, df.shape)]}
+
+                if target is not None and kinds[target] not in RELATABLE_KINDS:
+                    raise EDAError(
+                        ErrorCode.INVALID_OPERATION,
+                        f"{target} is {kinds[target].value}; it has no relationships to rank",
+                        "choose a numeric, date or categorical column as target",
+                    )
+
+                if group_by is not None:
+                    groups = int(df[labels[group_by]].nunique())
+                    if kinds[group_by] not in GROUPABLE_KINDS or groups > MAX_GROUPS:
+                        raise EDAError(
+                            ErrorCode.INVALID_OPERATION,
+                            f"{group_by} has {groups:,} distinct values; too many to group by",
+                            f"group by a column with at most {MAX_GROUPS} values, "
+                            "or bin this one first",
+                        )
+                    shown, findings = compare_groups(
+                        df, kinds, group_by, [target] if target else None
+                    )
+                    body["group_by"] = group_by
+                    body["groups"] = shown
+                    summary = (
+                        f"{len(findings)} column(s) differ meaningfully across the "
+                        f"{groups} groups of {group_by}."
+                    )
+                elif target is not None:
+                    pairs = target_pairs(df, kinds, target)
+                    findings = [p.finding() for p in pairs]
+                    body["target"] = target
+                    summary = f"{len(pairs)} column(s) related to {target}" + (
+                        f"; strongest {pairs[0].b} ({pairs[0].detail})." if pairs else "."
+                    )
+                else:
+                    pairs, numeric, pearson, tested = all_pairs(df, kinds)
+                    strong = [p for p in pairs if p.strength >= REPORT_STRENGTH]
+                    findings = collinearity_findings(df, numeric, pearson)
+                    clusters = len(findings)
+                    findings.extend(p.finding() for p in strong)
+                    body["pairs_tested"] = tested
+                    summary = (
+                        f"{len(strong)} strong relationship(s) among "
+                        f"{sum(tested.values()):,} pairs tested"
+                        + (f"; {clusters} collinearity problem(s)." if clusters else ".")
+                    )
+
+                response = Response(
+                    "check_relationships",
+                    body=body,
+                    findings=findings,
+                    remedy="call again with target= to focus on one column",
+                )
+                response.summary = summary
                 record["findings"] = len(findings)
                 return response.build()
         except EDAError as exc:

@@ -610,3 +610,159 @@ def test_analyze_column_identical_on_sorted_copy(settings: Settings, messy: pd.D
 )
 def test_analyze_column_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
     assert call(server, "analyze_column", args)["error"]["code"] == code
+
+
+# --------------------------------------------------------------------------
+# relations
+
+
+def test_pairwise_corr_matches_pandas_with_gaps() -> None:
+    from eda_mcp.relations import pairwise_corr
+
+    rng = np.random.default_rng(7)
+    n = 20_000
+    a = rng.normal(0, 1, n)
+    df = pd.DataFrame(
+        {
+            "a": a,
+            "b": 2 * a + rng.normal(0, 1, n),
+            "big": rng.normal(5e6, 1, n),  # a large offset must not cost precision
+            "c": np.exp(a) + rng.normal(0, 0.1, n),
+        }
+    )
+    for column, share in (("a", 0.1), ("b", 0.3), ("c", 0.05)):
+        df.loc[rng.random(n) < share, column] = np.nan
+    r, counts = pairwise_corr(df.to_numpy())
+    assert np.allclose(r, df.corr().to_numpy(), atol=1e-9)
+    present = df.notna().to_numpy(dtype=int)
+    assert np.array_equal(counts, present.T @ present)
+
+
+@given(st.lists(st.one_of(finite, st.just(float("nan"))), min_size=5, max_size=80))
+@hyp_settings(max_examples=60, deadline=None)
+def test_ranks_match_scipy(values: list[float]) -> None:
+    from scipy import stats as scipy_stats
+
+    from eda_mcp.relations import _ranks
+
+    x = np.round(np.array(values), 0)  # rounding forces ties
+    present = ~np.isnan(x)
+    ranks = _ranks(x)
+    assert np.isnan(ranks[~present]).all()
+    assert np.allclose(ranks[present], scipy_stats.rankdata(x[present]))
+
+
+def test_cramers_v_is_not_inflated_by_cardinality() -> None:
+    from eda_mcp.relations import cramers_v
+
+    rng = np.random.default_rng(8)
+    a = rng.integers(0, 40, 5000)
+    assert cramers_v(a, rng.integers(0, 40, 5000)) < 0.05  # independent, many levels
+    assert cramers_v(a, a) == pytest.approx(1.0, abs=0.01)
+
+
+def test_group_stats_matches_anova() -> None:
+    from scipy import stats as scipy_stats
+
+    from eda_mcp.relations import group_stats
+
+    rng = np.random.default_rng(9)
+    groups = rng.integers(0, 3, 600)
+    values = rng.normal(0, 1, 600) + 0.15 * groups
+    result = group_stats(groups, values)
+    assert result is not None
+    expected = scipy_stats.f_oneway(*(values[groups == g] for g in range(3))).pvalue
+    assert result.p == pytest.approx(expected, rel=1e-9)
+
+
+def relationship_lines(df: pd.DataFrame) -> list[str]:
+    """What the tool would report for *df*: collinearity, then strong pairs."""
+    from eda_mcp.relations import REPORT_STRENGTH, all_pairs, collinearity_findings
+
+    kinds = column_kinds(df)
+    pairs, numeric, pearson, _ = all_pairs(df, kinds)
+    findings = collinearity_findings(df, numeric, pearson)
+    strong = [p.finding().render() for p in pairs if p.strength >= REPORT_STRENGTH]
+    return [f.render() for f in findings] + strong
+
+
+def test_collinear_columns_keep_the_most_complete() -> None:
+    rng = np.random.default_rng(10)
+    a = rng.normal(0, 1, 2000)
+    df = pd.DataFrame(
+        {"a": a, "a2": 2 * a + rng.normal(0, 0.05, 2000), "z": rng.normal(0, 1, 2000)}
+    )
+    df.loc[:99, "a"] = np.nan
+    lines = relationship_lines(df)
+    assert any("a, a2 move together" in line and "keep a2" in line for line in lines)
+    assert not any("z" in line for line in lines)
+
+
+def test_vif_catches_a_sum_no_pair_reveals() -> None:
+    rng = np.random.default_rng(11)
+    a, b = rng.normal(0, 1, 3000), rng.normal(0, 1, 3000)
+    df = pd.DataFrame({"a": a, "b": b, "total": a + b + rng.normal(0, 0.05, 3000)})
+    lines = relationship_lines(df)
+    assert not any("move together" in line for line in lines)  # each pair is only ~0.7
+    assert any("VIF" in line for line in lines)
+
+
+def test_monotonic_curve_is_called_non_linear() -> None:
+    x = np.linspace(0, 5, 2000)
+    df = pd.DataFrame({"x": x, "y": np.exp(2 * x)})
+    assert any("monotonic, not linear" in line for line in relationship_lines(df))
+
+
+def test_check_relationships_scans_the_table(server) -> None:  # type: ignore[no-untyped-def]
+    payload = call(server, "check_relationships", {"source": "m"})
+    assert payload["findings"][0].startswith("MED  churned, churn_score move together")
+    assert payload["pairs_tested"]["numeric"] == 15
+    # the fixture's other columns were generated independently
+    assert len(payload["findings"]) == 2
+
+
+def test_check_relationships_target_and_groups(server) -> None:  # type: ignore[no-untyped-def]
+    target = call(server, "check_relationships", {"source": "m", "target": "churn_score"})
+    assert target["findings"] == ["INFO churn_score vs churned: r=+1.00"]
+
+    grouped = call(server, "check_relationships", {"source": "m", "group_by": "churned"})
+    assert grouped["groups"] == {"0": 4839, "1": 311}
+    assert "churn_score by churned" in grouped["findings"][0]
+    assert "(1 vs 0)" in grouped["findings"][0]
+
+
+def test_check_relationships_stays_within_budget(tmp_path: Path) -> None:
+    rng = np.random.default_rng(12)
+    base = rng.normal(0, 1, (500, 5))
+    wide = pd.DataFrame({f"c{i}": base[:, i % 5] + rng.normal(0, 0.3, 500) for i in range(40)})
+    wide.to_csv(tmp_path / "wide.csv", index=False)
+    srv = build_server(load_settings(log_level="WARNING", allowed_paths=[tmp_path]))
+    call(srv, "load_dataset", {"source": str(tmp_path / "wide.csv"), "alias": "w"})
+
+    payload = call(srv, "check_relationships", {"source": "w"})
+    assert estimate_tokens(payload) <= 800 * 1.15
+    assert payload["truncated"]["omitted"] > 0
+    assert "target=" in payload["truncated"]["remedy"]
+
+
+def test_check_relationships_identical_on_sorted_copy(settings: Settings) -> None:
+    srv = build_server(settings)
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "a"})
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy_sorted.csv"), "alias": "b"})
+    for args in ({}, {"group_by": "churned"}, {"target": "price"}):
+        a = call(srv, "check_relationships", {"source": "a", **args})
+        b = call(srv, "check_relationships", {"source": "b", **args})
+        assert a.get("findings") == b.get("findings"), args
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"source": "m", "group_by": "price"}, "INVALID_OPERATION"),
+        ({"source": "m", "target": "customer_id"}, "INVALID_OPERATION"),
+        ({"source": "m", "target": "nope"}, "COLUMN_NOT_FOUND"),
+        ({"source": "nope"}, "SOURCE_NOT_FOUND"),
+    ],
+)
+def test_check_relationships_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(server, "check_relationships", args)["error"]["code"] == code
