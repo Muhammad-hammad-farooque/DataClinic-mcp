@@ -49,6 +49,8 @@ from eda_mcp.relations import (
     compare_groups,
     target_pairs,
 )
+from eda_mcp.target import analyze_target as assess_target
+from eda_mcp.target import task_for
 
 # Behavioural hints let a client skip confirmation on safe calls. read_only
 # means no *source* is modified; destructive is reserved for export, the one
@@ -453,6 +455,61 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                 )
                 response.summary = summary
                 record["findings"] = len(findings)
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
+        name="analyze_target",
+        description=(
+            "Assess a prediction target: classification or regression, class balance "
+            "or skew, every feature ranked by strength, and leakage -- features that "
+            "encode the answer. Run before modelling."
+        ),
+        annotations=READ_ONLY_LOCAL,
+    )
+    def analyze_target(source: str, target: str) -> dict[str, Any]:
+        try:
+            with tool_call("analyze_target", source=source, target=target) as record:
+                df = registry.get_dataset(source).df
+                labels = {str(c): c for c in df.columns}
+                if target not in labels:
+                    raise ColumnNotFoundError(target, list(labels))
+                kinds = column_kinds(df)
+                task = task_for(df[labels[target]], kinds[target])
+                if task is None:
+                    raise EDAError(
+                        ErrorCode.INVALID_OPERATION,
+                        f"{target} is {kinds[target].value}; it cannot be a prediction target",
+                        "choose a numeric or categorical column with more than one value",
+                    )
+
+                report = assess_target(df, kinds, target, task)
+                body: dict[str, Any] = {"dataset": source, "target": target, "task": report.task}
+                body.update(report.body)
+
+                response = Response(
+                    "analyze_target",
+                    body=body,
+                    findings=report.findings,
+                    remedy="the weakest features were cut; check_relationships target= lists all",
+                )
+                rows = report.body["rows_with_target"]
+                if report.leaks:
+                    lead = f"{len(report.leaks)} probable leak(s): {', '.join(report.leaks)}"
+                else:
+                    lead = "No leakage found"
+                if report.ranked:
+                    best = report.ranked[0]
+                    tail = f"strongest feature {best.feature} ({best.detail})."
+                else:
+                    tail = "no feature shows a meaningful link."
+                response.summary = f"{report.task}, {rows:,} rows. {lead}; {tail}"
+
+                record["task"] = task
+                record["leaks"] = len(report.leaks)
                 return response.build()
         except EDAError as exc:
             return exc.to_dict()

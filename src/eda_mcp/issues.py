@@ -128,7 +128,7 @@ def _sentinels(profile: ColumnProfile) -> tuple[Finding | None, int]:
     return finding, sum(c for v, c in codes.items() if v < 0)
 
 
-def _simplest_transform(transforms: dict[str, float]) -> str:
+def simplest_transform(transforms: dict[str, float]) -> str:
     """The simplest transform that removes the skew, else the most effective.
 
     Measured, not assumed. A log needs no fitted parameter to store and
@@ -171,7 +171,7 @@ def _numeric(profile: ColumnProfile) -> list[Finding]:
             message += f", {outliers:,} outliers beyond 1.5 IQR"
         transforms = stats.get("transforms")
         if transforms:
-            best = _simplest_transform(transforms)
+            best = simplest_transform(transforms)
             after = round(transforms[best], 2) + 0.0  # + 0.0 turns -0.0 into 0.0
             advice = f"apply {best} (skew {skew:.2g} -> {after:.2f})"
         elif skew > 0 and stats.get("min", -1) >= 0:
@@ -626,4 +626,5 @@ __all__ = [
     "frame_findings",
     "missingness_relations",
     "needs_attention",
+    "simplest_transform",
 ]

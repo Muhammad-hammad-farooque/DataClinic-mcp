@@ -288,8 +288,10 @@ def call(server, tool, args):  # type: ignore[no-untyped-def]
     return payload.structured_content
 
 
-@pytest.fixture()
+@pytest.fixture(scope="module")
 def server(settings: Settings):  # type: ignore[no-untyped-def]
+    # Shared across the module: every Phase 2 tool is read-only, so no test
+    # can change what another sees. Mutation tests (Phase 4) need their own.
     srv = build_server(settings)
     call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "m"})
     return srv
@@ -518,11 +520,11 @@ def test_vectorised_missingness_correlation_matches_pandas(monkeypatch) -> None:
 
 
 def test_simplest_sufficient_transform_wins() -> None:
-    from eda_mcp.issues import _simplest_transform
+    from eda_mcp.issues import simplest_transform
 
-    assert _simplest_transform({"log1p": 0.3, "boxcox": 0.0}) == "log1p"
-    assert _simplest_transform({"log1p": 0.9, "boxcox": 0.01}) == "boxcox"
-    assert _simplest_transform({"log1p": 0.9, "yeojohnson": -0.7}) == "yeojohnson"
+    assert simplest_transform({"log1p": 0.3, "boxcox": 0.0}) == "log1p"
+    assert simplest_transform({"log1p": 0.9, "boxcox": 0.01}) == "boxcox"
+    assert simplest_transform({"log1p": 0.9, "yeojohnson": -0.7}) == "yeojohnson"
 
 
 def test_numeric_detail_matches_numpy(messy: pd.DataFrame) -> None:
@@ -766,3 +768,144 @@ def test_check_relationships_identical_on_sorted_copy(settings: Settings) -> Non
 )
 def test_check_relationships_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
     assert call(server, "check_relationships", args)["error"]["code"] == code
+
+
+# --------------------------------------------------------------------------
+# target
+
+
+def assess(df: pd.DataFrame, target: str):  # type: ignore[no-untyped-def]
+    from eda_mcp.target import analyze_target, task_for
+
+    kinds = column_kinds(df)
+    task = task_for(df[target], kinds[target])
+    assert task is not None
+    return analyze_target(df, kinds, target, task)
+
+
+def test_task_is_inferred_from_the_target() -> None:
+    from eda_mcp.target import task_for
+
+    rng = np.random.default_rng(13)
+    cases = {
+        "flag": (pd.Series(rng.integers(0, 2, 500)), "classification"),
+        "grade": (pd.Series(rng.integers(1, 6, 500)), "classification"),
+        "count": (pd.Series(rng.integers(0, 200, 500)), "regression"),
+        "amount": (pd.Series(rng.normal(0, 1, 500)), "regression"),
+        "label": (pd.Series(rng.choice(["a", "b"], 500)), "classification"),
+        "key": (pd.Series(np.arange(500)), None),
+        "same": (pd.Series([1.0] * 500), None),
+    }
+    for name, (series, expected) in cases.items():
+        kind = column_kinds(series.to_frame(name))[name]
+        assert task_for(series, kind) == expected, name
+
+
+def test_regression_strength_ranking_and_leak() -> None:
+    rng = np.random.default_rng(14)
+    n = 3000
+    x1, x2 = rng.normal(0, 1, n), rng.normal(0, 1, n)
+    region = rng.choice(["n", "s", "e", "w"], n)
+    y = 3 * x1 + 1.0 * x2 + (region == "e") * 2 + rng.normal(0, 1, n)
+    df = pd.DataFrame({"x1": x1, "x2": x2, "region": region, "noise": rng.normal(0, 1, n), "y": y})
+    df["y_copy"] = df["y"] * 1.001 + rng.normal(0, 0.01, n)  # recorded after the fact
+    report = assess(df, "y")
+    assert report.leaks == ["y_copy"]
+    ranked = [s.feature for s in report.ranked]
+    assert ranked[:3] == ["x1", "x2", "region"]
+    assert "noise" not in ranked  # no significant link
+
+
+def test_category_that_restates_the_class_is_leakage() -> None:
+    rng = np.random.default_rng(15)
+    churned = rng.choice([0, 1], 4000, p=[0.8, 0.2])
+    status = np.where(
+        churned == 1, rng.choice(["closed", "lapsed"], 4000), rng.choice(["active", "trial"], 4000)
+    )
+    df = pd.DataFrame(
+        {"status": status, "plan": rng.choice(["a", "b", "c"], 4000), "churned": churned}
+    )
+    assert assess(df, "churned").leaks == ["status"]
+
+
+def test_small_categories_are_not_pure_by_chance() -> None:
+    # 94% majority: five-row categories are often all-majority by luck alone
+    rng = np.random.default_rng(16)
+    df = pd.DataFrame(
+        {
+            "shop": np.repeat([f"s{i}" for i in range(800)], 5),
+            "churned": rng.choice([0, 1], 4000, p=[0.94, 0.06]),
+        }
+    )
+    assert assess(df, "churned").leaks == []
+
+
+def test_target_health_findings() -> None:
+    rng = np.random.default_rng(17)
+    df = pd.DataFrame(
+        {
+            "label": rng.choice(["Yes", "yes", "No"], 1000),
+            "x": rng.normal(0, 1, 1000),
+        }
+    )
+    df.loc[:49, "label"] = None
+    lines = [f.render() for f in assess(df, "label").findings]
+    assert any("rows with no target value" in line and "(50 rows)" in line for line in lines)
+    variant = [line for line in lines if "spelled several ways" in line]
+    assert len(variant) == 1 and "Yes" in variant[0] and "yes" in variant[0]
+
+
+def test_analyze_target_on_fixture(server) -> None:  # type: ignore[no-untyped-def]
+    payload = call(server, "analyze_target", {"source": "m", "target": "churned"})
+    assert payload["task"] == "classification (2 classes)"
+    assert payload["classes"] == {"0": 4839, "1": 311}
+    findings = payload["findings"]
+    assert findings[0].startswith("HIGH churned: severe imbalance: 94%")
+    assert any(f.startswith("HIGH churn_score: probable leakage") for f in findings)
+    assert "churn_score" in payload["summary"]
+
+    price = call(server, "analyze_target", {"source": "m", "target": "price"})
+    assert price["task"] == "regression"
+    assert "log1p(target)" in price["findings"][0]
+
+
+def test_analyze_target_stays_within_budget(tmp_path: Path) -> None:
+    rng = np.random.default_rng(18)
+    n = 2000
+    y = rng.normal(0, 1, n)
+    wide = pd.DataFrame({f"f{i}": y * (i + 1) / 200 + rng.normal(0, 1, n) for i in range(200)})
+    wide["y"] = y
+    wide.to_csv(tmp_path / "wide.csv", index=False)
+    srv = build_server(load_settings(log_level="WARNING", allowed_paths=[tmp_path]))
+    call(srv, "load_dataset", {"source": str(tmp_path / "wide.csv"), "alias": "w"})
+
+    payload = call(srv, "analyze_target", {"source": "w", "target": "y"})
+    assert estimate_tokens(payload) <= 800 * 1.15
+    assert payload["truncated"]["omitted"] > 0
+    # strongest first, so the budget cut drops only the weakest features
+    shown = [abs(float(f.split("r=")[1])) for f in payload["findings"]]
+    assert shown == sorted(shown, reverse=True) and shown[0] > 0.65
+
+
+def test_analyze_target_identical_on_sorted_copy(settings: Settings) -> None:
+    srv = build_server(settings)
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "a"})
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy_sorted.csv"), "alias": "b"})
+    for target in ("churned", "price", "country"):
+        a = call(srv, "analyze_target", {"source": "a", "target": target})
+        b = call(srv, "analyze_target", {"source": "b", "target": target})
+        a.pop("dataset"), b.pop("dataset")
+        assert a == b, target
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"source": "m", "target": "customer_id"}, "INVALID_OPERATION"),
+        ({"source": "m", "target": "region_code"}, "INVALID_OPERATION"),
+        ({"source": "m", "target": "nope"}, "COLUMN_NOT_FOUND"),
+        ({"source": "nope", "target": "price"}, "SOURCE_NOT_FOUND"),
+    ],
+)
+def test_analyze_target_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(server, "analyze_target", args)["error"]["code"] == code

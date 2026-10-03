@@ -7,9 +7,10 @@ workflow — inspect a dataset, diagnose what is wrong with it, fix it, and writ
 the result back out.
 
 > **Status: early alpha.** Phase 1 of 6 is complete and Phase 2 is under way.
-> Six tools work today (`load_dataset`, `profile`, `find_issues`,
-> `analyze_column`, `check_relationships`, `manage_sources`). The remaining
-> analysis tools, cleaning and database support are **not implemented yet**. See
+> Seven tools work today (`load_dataset`, `profile`, `find_issues`,
+> `analyze_column`, `check_relationships`, `analyze_target`,
+> `manage_sources`). `query`, cleaning and database support are **not
+> implemented yet**. See
 > [Current state](#current-state) for exactly what runs.
 
 ---
@@ -107,6 +108,7 @@ Restart the client and the tools appear.
 | `find_issues` | Every data-quality problem, ranked, each with the one fix to apply. Beyond the per-column checks it finds missingness that depends on another column, identical columns, records repeated under fresh keys, placeholder codes such as `-999`, and dates or null markers stored as text. `severity` filters to `high`, `medium` or `low` and up |
 | `analyze_column` | Deep dive on one column, adapted to its type. Numbers get percentiles, a histogram, a normality test and the skew left by each candidate transform, so the recommended fix names the simplest one that works. Categories get the full value list and encoding advice; dates a breakdown by year, month and weekday plus missing days; identifiers their key formats and repeated keys |
 | `check_relationships` | Ranked relationships, never a full matrix. With no arguments: the strongest pairs of any type (Pearson and Spearman for numbers, bias-corrected Cramér's V for categories, the correlation ratio for mixed pairs) plus groups of near-interchangeable columns to prune. `target=` ranks every column's link to one column; `group_by=` compares every column across groups with effect sizes |
+| `analyze_target` | Assesses a prediction target before modelling: classification or regression, class balance or skew, every feature ranked by strength, and **leakage** -- features that encode the answer, including categories that map one-to-one to classes (judged against chance, so an imbalanced target does not trigger false alarms) |
 | `manage_sources` | Lists what is open in the session, or closes one to free memory |
 
 `load_dataset` returns a profile in its first response, so there is no need for
@@ -130,7 +132,7 @@ mistaken for a key.
 
 ### Not built yet
 
-`analyze_target` · `query` · `validate_rules` · `clean_data` ·
+`query` · `validate_rules` · `clean_data` ·
 `transform_data` · `reshape_data` · `history` · `plot` · `generate` · `export`
 · database connectivity
 
@@ -235,7 +237,7 @@ contain values from your data.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Config, errors, logging, registry, loaders, budgeting, `load_dataset` | **done** |
-| 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | in progress (`profile`, `find_issues`, `analyze_column`, `check_relationships` done) |
+| 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | in progress (all but `query` done) |
 | 3 | Database read path — PostgreSQL, MySQL, SQLite, DuckDB, push-down profiling | planned |
 | 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | planned |
 | 5 | `plot`, `generate`, `export`, MCP resources | planned |
