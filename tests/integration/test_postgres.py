@@ -23,6 +23,11 @@ import pytest
 
 DSN = os.environ.get("EDA_TEST_POSTGRES_DSN", "")
 
+# CI sets EDA_REQUIRE_INTEGRATION so that a missing DSN fails the job loudly
+# instead of letting every test here skip and the job pass on nothing.
+if os.environ.get("EDA_REQUIRE_INTEGRATION") and not DSN:
+    raise RuntimeError("EDA_REQUIRE_INTEGRATION is set but EDA_TEST_POSTGRES_DSN is not")
+
 pytestmark = [
     pytest.mark.integration,
     pytest.mark.skipif(not DSN, reason="EDA_TEST_POSTGRES_DSN is not set"),

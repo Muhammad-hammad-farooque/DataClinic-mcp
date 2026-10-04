@@ -73,13 +73,14 @@ jobs:
           --health-retries 10
     env:
       EDA_TEST_POSTGRES_DSN: postgresql://postgres:ci-only-password@localhost:5432/eda
+      EDA_REQUIRE_INTEGRATION: "1"
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
       - run: uv sync --locked --extra sql --extra postgres
-      - run: uv run pytest -m integration tests/integration
+      - run: uv run pytest -m integration -rs tests/integration
 
   security:
     runs-on: ubuntu-latest

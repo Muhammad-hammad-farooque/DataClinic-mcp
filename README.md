@@ -6,12 +6,12 @@ An MCP server that lets an AI assistant run a full exploratory data analysis
 workflow — inspect a dataset, diagnose what is wrong with it, fix it, and write
 the result back out.
 
-> **Status: early alpha.** Phases 1 and 2 of 6 are complete and Phase 3
-> (databases) is under way. Ten tools work today (`load_dataset`, `profile`,
-> `find_issues`, `analyze_column`, `check_relationships`, `analyze_target`,
-> `query`, `connect_database`, `explore_schema`, `manage_sources`). Cleaning
-> and output are **not implemented yet**.
-> See [Current state](#current-state) for exactly what runs.
+> **Status: early alpha.** Phases 1–3 of 6 are complete. Ten tools work today
+> (`load_dataset`, `profile`, `find_issues`, `analyze_column`,
+> `check_relationships`, `analyze_target`, `query`, `connect_database`,
+> `explore_schema`, `manage_sources`), on files, SQLite and PostgreSQL.
+> Cleaning and output are **not implemented yet**. See
+> [Current state](#current-state) for exactly what runs.
 
 ---
 
@@ -254,7 +254,7 @@ contain values from your data.
 |---|---|---|
 | 1 | Config, errors, logging, registry, loaders, budgeting, `load_dataset` | **done** |
 | 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | **done** |
-| 3 | Database read path — SQLite and PostgreSQL first, push-down profiling, SQL in `query` | in progress (all but the live-PostgreSQL CI job done) |
+| 3 | Database read path — SQLite and PostgreSQL first, push-down profiling, SQL in `query` | **done** |
 | 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | planned |
 | 5 | `plot`, `generate`, `export`, MCP resources | planned |
 | 6 | Cost benchmark, performance gates, docs | planned |
