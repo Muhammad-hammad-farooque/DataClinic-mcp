@@ -1,4 +1,4 @@
-# Checks from spec section 16.6. The db and bench jobs arrive with phases 3 and 6.
+# Checks from spec section 16.6. The bench job arrives with phase 6.
 name: CI
 
 on:
@@ -53,6 +53,33 @@ jobs:
           enable-cache: true
       - run: uv sync --locked --extra sql --extra duckdb
       - run: uv run pytest -m "not integration and not slow"
+
+  postgres:
+    # The database tools against a real server: read-only sessions,
+    # statement_timeout, PERCENTILE_CONT, TABLESAMPLE ... REPEATABLE.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: ci-only-password  # a throwaway container, not a secret
+          POSTGRES_DB: eda
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      EDA_TEST_POSTGRES_DSN: postgresql://postgres:ci-only-password@localhost:5432/eda
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --extra sql --extra postgres
+      - run: uv run pytest -m integration tests/integration
 
   security:
     runs-on: ubuntu-latest

@@ -266,6 +266,8 @@ contain values from your data.
 ```bash
 uv sync --group dev --extra sql --extra duckdb
 uv run pytest                       # unit + adversarial suites
+# integration tests against a real PostgreSQL (they skip without this variable)
+EDA_TEST_POSTGRES_DSN=postgresql://user:pass@localhost/db uv run --extra postgres pytest -m integration
 uv run pytest --cov=eda_mcp         # coverage
 uv run ruff check src tests         # lint
 uv run ruff format src tests        # format

@@ -19,6 +19,8 @@ See spec sections 7.2 and 12.1.
 from __future__ import annotations
 
 import ast
+import datetime
+import decimal
 import difflib
 import math
 import re
@@ -521,6 +523,13 @@ def jsonable(value: Any) -> Any:
         return None
     if isinstance(value, (pd.Timestamp, np.datetime64)):
         return pd.Timestamp(value).isoformat()
+    if isinstance(value, (datetime.date, datetime.time)):
+        return value.isoformat()  # what database drivers return for DATE / TIME
+    if isinstance(value, decimal.Decimal):
+        # PostgreSQL NUMERIC arrives as Decimal; it is a number, not text.
+        if not value.is_finite():
+            return None
+        return int(value) if value == value.to_integral_value() else float(value)
     if isinstance(value, np.generic):
         value = value.item()
     if isinstance(value, float):
