@@ -319,3 +319,90 @@ def test_passwords_never_reach_responses_or_logs(
     captured = capfd.readouterr()
     for blob in (json.dumps(payloads), captured.out, captured.err):
         assert "hunter2" not in blob
+
+
+# --------------------------------------------------------------------------
+# loading tables and queries
+
+
+@pytest.fixture()
+def connected(server, shop: Path):  # type: ignore[no-untyped-def]
+    call(server, "connect_database", {"alias": "shop", "dsn": dsn_for(shop)})
+    return server
+
+
+def test_load_table_then_analyse_it(connected) -> None:  # type: ignore[no-untyped-def]
+    payload = call(connected, "load_dataset", {"source": "shop.customers"})
+    assert payload["dataset"] == "customers" and payload["shape"] == [50, 3]
+    assert payload["origin"] == "shop:main.customers"
+    assert payload["read"] == {"format": "sqlite", "rows_available": 50}
+    # once loaded, it is an ordinary dataset for every analysis tool
+    counts = call(connected, "query", {"source": "customers", "expression": "count(by=country)"})
+    assert counts["values"] == {"FR": 17, "UK": 17, "US": 16}
+
+
+def test_schema_qualified_reference_and_types(connected) -> None:  # type: ignore[no-untyped-def]
+    payload = call(connected, "load_dataset", {"source": "shop.main.orders", "alias": "o"})
+    assert payload["shape"] == [500, 4]
+    assert payload["read"]["coerced"] == {"placed": "datetime"}  # text dates parsed
+
+
+def test_large_table_refused_without_limit(shop: Path) -> None:
+    small = load_settings(log_level="WARNING", allowed_paths=[shop.parent], max_load_rows=400)
+    srv = build_server(small)
+    call(srv, "connect_database", {"alias": "shop", "dsn": dsn_for(shop)})
+
+    refused = call(srv, "load_dataset", {"source": "shop.orders"})
+    assert refused["error"]["code"] == "SOURCE_TOO_LARGE"
+    assert "profile" in refused["error"]["remedy"]
+
+    limited = call(srv, "load_dataset", {"source": "shop.orders", "limit": 100})
+    assert limited["shape"][0] == 100 and limited["read"]["rows_available"] == 500
+    assert any("not a random sample" in f for f in limited["findings"])
+
+    query = call(srv, "load_dataset", {"source": "shop", "query": "SELECT * FROM orders"})
+    assert query["error"]["code"] == "SOURCE_TOO_LARGE"
+
+
+def test_load_query_result(connected) -> None:  # type: ignore[no-untyped-def]
+    sql = "SELECT country, COUNT(*) AS n FROM customers GROUP BY country ORDER BY country"
+    payload = call(connected, "load_dataset", {"source": "shop", "query": sql})
+    assert payload["dataset"] == "shop_query" and payload["shape"] == [3, 2]
+    assert payload["origin"] == "shop:query"
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"source": "shop", "query": "DELETE FROM orders"}, "STATEMENT_REJECTED"),
+        ({"source": "shop", "query": "SELECT 1; DROP TABLE orders"}, "STATEMENT_REJECTED"),
+        ({"source": "shop", "query": "SELECT * FROM missing_table"}, "INVALID_OPERATION"),
+        ({"source": "shop.orders", "options": {"sheet": 1}}, "INVALID_OPERATION"),
+        ({"source": "shop.orders", "limit": 0}, "INVALID_OPERATION"),
+        ({"source": "shop.nope"}, "SOURCE_NOT_FOUND"),
+        ({"source": "shop.nope.orders"}, "SOURCE_NOT_FOUND"),
+        ({"source": "elsewhere", "query": "SELECT 1"}, "SOURCE_NOT_FOUND"),
+    ],
+)
+def test_load_from_database_errors(connected, args, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(connected, "load_dataset", args)["error"]["code"] == code
+
+
+def test_loading_never_changes_the_database(connected, shop: Path) -> None:  # type: ignore[no-untyped-def]
+    before = sqlite3.connect(shop).execute("SELECT COUNT(*), SUM(amount) FROM orders").fetchone()
+    call(connected, "load_dataset", {"source": "shop.orders"})
+    call(
+        connected,
+        "load_dataset",
+        {"source": "shop", "query": "SELECT * FROM orders WHERE amount > 1"},
+    )
+    after = sqlite3.connect(shop).execute("SELECT COUNT(*), SUM(amount) FROM orders").fetchone()
+    assert before == after
+
+
+def test_existing_file_wins_over_a_connection(connected, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    # "shop.orders" names a real file here, so it must not load the table.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "shop.orders").write_text("not a table")
+    payload = call(connected, "load_dataset", {"source": "shop.orders"})
+    assert payload["error"]["code"] in ("UNSUPPORTED_FORMAT", "PATH_NOT_ALLOWED")

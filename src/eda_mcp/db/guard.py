@@ -120,11 +120,13 @@ def _function_name(node: exp.Func) -> str:
     return node.sql_name().lower()
 
 
-def check(sql: str, dialect: str, row_cap: int | None = None) -> Checked:
+def check(sql: str, dialect: str, row_cap: int | None = None, count: bool = False) -> Checked:
     """Validate *sql* for *dialect* (a sqlglot name) and return what to run.
 
     With *row_cap*, the statement is wrapped so it can return at most that
-    many rows. Raises ``StatementRejectedError`` naming the reason otherwise.
+    many rows. With *count*, it is wrapped as ``SELECT COUNT(*) FROM (...)``
+    instead, to size a result before fetching it. Raises
+    ``StatementRejectedError`` naming the reason otherwise.
     """
     _require()
     if len(sql) > MAX_SQL_LENGTH:
@@ -162,7 +164,9 @@ def check(sql: str, dialect: str, row_cap: int | None = None) -> Checked:
             if name in DENIED_FUNCTIONS:
                 raise StatementRejectedError(f"the function {name}() is not allowed")
 
-    if row_cap is not None:
+    if count:
+        tree = exp.select(exp.Count(this=exp.Star())).from_(tree.subquery("guarded"))
+    elif row_cap is not None:
         tree = exp.select("*").from_(tree.subquery("guarded")).limit(row_cap)
     return Checked(tree.sql(dialect=dialect, comments=False), dialect)
 

@@ -9,8 +9,8 @@ the result back out.
 > **Status: early alpha.** Phases 1 and 2 of 6 are complete and Phase 3
 > (databases) is under way. Ten tools work today (`load_dataset`, `profile`,
 > `find_issues`, `analyze_column`, `check_relationships`, `analyze_target`,
-> `query`, `connect_database`, `explore_schema`, `manage_sources`). Loading and
-> profiling database tables, cleaning and output are **not implemented yet**.
+> `query`, `connect_database`, `explore_schema`, `manage_sources`). Profiling
+> tables inside the database, cleaning and output are **not implemented yet**.
 > See [Current state](#current-state) for exactly what runs.
 
 ---
@@ -104,7 +104,7 @@ Restart the client and the tools appear.
 
 | Tool | What it does |
 |---|---|
-| `load_dataset` | Reads CSV, TSV, Excel, Parquet, JSON or NDJSON into the session and returns shape, column classifications, missing-data summary, duplicate count and ranked findings |
+| `load_dataset` | Reads CSV, TSV, Excel, Parquet, JSON or NDJSON — or a database table (`connection.table`) or guarded `SELECT` (`query=`) — into the session and returns shape, column classifications, missing-data summary, duplicate count and ranked findings. Tables are sized before any row moves; one above `EDA_MCP_MAX_LOAD_ROWS` is refused without `limit=` |
 | `profile` | Full-population statistics per column with ranked findings, each carrying one recommended fix. Problem columns are shown in full and clean ones rolled up into a line; `detail` is `brief`, `standard` or `full`, and `columns=` narrows to named columns |
 | `find_issues` | Every data-quality problem, ranked, each with the one fix to apply. Beyond the per-column checks it finds missingness that depends on another column, identical columns, records repeated under fresh keys, placeholder codes such as `-999`, and dates or null markers stored as text. `severity` filters to `high`, `medium` or `low` and up |
 | `analyze_column` | Deep dive on one column, adapted to its type. Numbers get percentiles, a histogram, a normality test and the skew left by each candidate transform, so the recommended fix names the simplest one that works. Categories get the full value list and encoding advice; dates a breakdown by year, month and weekday plus missing days; identifiers their key formats and repeated keys |
@@ -254,7 +254,7 @@ contain values from your data.
 |---|---|---|
 | 1 | Config, errors, logging, registry, loaders, budgeting, `load_dataset` | **done** |
 | 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | **done** |
-| 3 | Database read path — SQLite and PostgreSQL first, push-down profiling, SQL in `query` | in progress (guard, `connect_database`, `explore_schema` done) |
+| 3 | Database read path — SQLite and PostgreSQL first, push-down profiling, SQL in `query` | in progress (guard, `connect_database`, `explore_schema`, loading tables done) |
 | 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | planned |
 | 5 | `plot`, `generate`, `export`, MCP resources | planned |
 | 6 | Cost benchmark, performance gates, docs | planned |

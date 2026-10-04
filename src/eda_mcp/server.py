@@ -20,6 +20,7 @@ from eda_mcp import __version__
 from eda_mcp.config import Settings, load_settings
 from eda_mcp.db.connect import env_name, open_engine, resolve_dsn
 from eda_mcp.db.introspect import describe_table, overview, tables
+from eda_mcp.db.load import load_query, load_table, split_reference
 from eda_mcp.digest import BUDGETS, DEFAULT_BUDGET, Finding, Response, Severity, fit
 from eda_mcp.errors import ColumnNotFoundError, EDAError, ErrorCode, SourceTooLargeError
 from eda_mcp.expressions import evaluate, present
@@ -141,34 +142,64 @@ def build_server(settings: Settings | None = None) -> MCPServer:
     @server.tool(
         name="load_dataset",
         description=(
-            "Load a CSV, Excel, Parquet or JSON file into the session. Returns shape, "
-            "column kinds, missing-data summary and the top findings -- do not call "
-            "profile straight after this."
+            "Load data into the session: a CSV, Excel, Parquet or JSON file; a database "
+            "table as connection.table (or connection.schema.table); or a SELECT on a "
+            "connection with source=connection, query=. Returns shape, column kinds, "
+            "missing-data summary and the top findings -- do not call profile straight "
+            "after this."
         ),
         annotations=READ_ONLY_EXTERNAL,
     )
     def load_dataset(
         source: str,
         alias: str | None = None,
+        query: str | None = None,
         limit: int | None = None,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
-            with tool_call("load_dataset", source=source) as record:
-                df, report = load_file(source, settings, limit=limit, options=options)
+            # A query can quote data values, so only its presence is logged.
+            with tool_call("load_dataset", source=source, query=query is not None) as record:
+                # A real file always wins, so a connection can never shadow one.
+                reference = None
+                if query is None and not Path(source).expanduser().exists():
+                    reference = split_reference(source, registry.connections)
 
-                if len(df) > settings.max_load_rows:
-                    raise SourceTooLargeError(source, len(df), settings.max_load_rows)
+                read: dict[str, Any] = {}
+                if query is not None or reference is not None:
+                    if options:
+                        raise EDAError(
+                            ErrorCode.INVALID_OPERATION,
+                            "options= applies to files, not database sources",
+                            "drop options=, or filter in the SQL with query=",
+                        )
+                    if query is not None:
+                        loaded = load_query(registry.get_connection(source), query, settings, limit)
+                    else:
+                        assert reference is not None
+                        connection_alias, schema, table = reference
+                        connection = registry.get_connection(connection_alias)
+                        loaded = load_table(connection, schema, table, settings, limit)
+                    df, report, origin = loaded.df, loaded.report, loaded.origin
+                    preferred = loaded.default_alias
+                    read["rows_available"] = loaded.available
+                    if not loaded.exact:
+                        read["row_count_exact"] = False
+                else:
+                    df, report = load_file(source, settings, limit=limit, options=options)
+                    if len(df) > settings.max_load_rows:
+                        raise SourceTooLargeError(source, len(df), settings.max_load_rows)
+                    origin, preferred = source, default_alias(source)
 
-                name = registry.unique_alias(alias or default_alias(source))
-                dataset = registry.add_dataset(name, df, origin=source)
+                name = registry.unique_alias(alias or preferred)
+                dataset = registry.add_dataset(name, df, origin=origin)
 
                 kinds = column_kinds(df)
                 body, findings = orientation(df, kinds)
                 body["dataset"] = name
-                body["origin"] = source
+                body["origin"] = origin
 
-                read: dict[str, Any] = {"format": report.format}
+                read = {"format": report.format, **read}
                 if report.encoding:
                     read["encoding"] = report.encoding
                 if report.delimiter:
