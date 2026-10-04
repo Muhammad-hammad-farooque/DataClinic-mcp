@@ -18,7 +18,8 @@ from mcp.types import ToolAnnotations
 
 from eda_mcp import __version__
 from eda_mcp.config import Settings, load_settings
-from eda_mcp.db.connect import env_name, open_engine, resolve_dsn
+from eda_mcp.db.connect import env_name, open_engine, read_frame, resolve_dsn
+from eda_mcp.db.guard import check, sqlglot_dialect
 from eda_mcp.db.introspect import describe_table, overview, tables
 from eda_mcp.db.load import load_query, load_table, split_reference
 from eda_mcp.db.sqlprofile import profile_table
@@ -30,7 +31,7 @@ from eda_mcp.errors import (
     SourceNotFoundError,
     SourceTooLargeError,
 )
-from eda_mcp.expressions import evaluate, present
+from eda_mcp.expressions import evaluate, present, present_sql
 from eda_mcp.instructions import INSTRUCTIONS
 from eda_mcp.issues import (
     column_findings,
@@ -592,11 +593,12 @@ def build_server(settings: Settings | None = None) -> MCPServer:
     @server.tool(
         name="query",
         description=(
-            "Ask a loaded dataset a precise question with a safe expression (Python "
-            'syntax, no code execution). A condition -- price > 100 and country == "UK" '
-            "-- counts and lists matching rows. Aggregates: count, sum, mean, median, "
-            "min, max, std, nunique, quantile, each with where= and by=, e.g. "
-            "mean(price, by=country). rows(col, ..., where=, sort=, desc=) picks columns. "
+            "Ask a precise question. On a database connection, expression is one "
+            "read-only SELECT, run in the database. On a loaded dataset, it is a safe "
+            "(Python syntax, no code execution) expression: a condition -- price > 100 and "
+            'country == "UK" -- counts and lists matching rows; aggregates count, sum, '
+            "mean, median, min, max, std, nunique, quantile take where= and by=, e.g. "
+            "mean(price, by=country); rows(col, ..., where=, sort=, desc=) picks columns. "
             "Quote names with spaces in backticks."
         ),
         annotations=READ_ONLY_EXTERNAL,
@@ -611,6 +613,22 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                         f"limit must be between 1 and {MAX_QUERY_ROWS}",
                         "use an aggregate with by= to summarise more rows than that",
                     )
+                budget = BUDGETS.get("query", DEFAULT_BUDGET)
+                if source in registry.connections:
+                    # SQL, run where the data lives: guarded, read-only, timed,
+                    # capped. One extra row tells us whether more exist.
+                    connection = registry.get_connection(source)
+                    dialect = sqlglot_dialect(connection.dialect)
+                    checked = check(expression, dialect, row_cap=limit + 1)
+                    frame, more = read_frame(
+                        connection.engine, connection.dialect, checked, settings, limit
+                    )
+                    body, summary = present_sql(frame, more, limit, budget)
+                    response = Response("query", body={"connection": source, **body})
+                    response.summary = summary
+                    record["result"] = "sql"
+                    return response.build()
+
                 df = registry.get_dataset(source).df
                 try:
                     result = evaluate(df, expression)
@@ -622,7 +640,6 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                         "check that each operation suits the column's type",
                     ) from None
 
-                budget = BUDGETS.get("query", DEFAULT_BUDGET)
                 body, summary = present(result, df, expression, limit, budget)
                 response = Response("query", body={"dataset": source, **body})
                 response.summary = summary

@@ -563,3 +563,89 @@ def test_profiling_never_changes_the_database(pushdown, sales) -> None:  # type:
     before = sqlite3.connect(path).execute(query).fetchone()
     call(pushdown, "profile", {"source": "s.sales"})
     assert sqlite3.connect(path).execute(query).fetchone() == before
+
+
+# --------------------------------------------------------------------------
+# SQL in query
+
+
+def test_sql_scalar_rows_and_joins(connected) -> None:  # type: ignore[no-untyped-def]
+    count = call(
+        connected, "query", {"source": "shop", "expression": "SELECT COUNT(*) AS n FROM orders"}
+    )
+    assert count["result"] == 500 and count["column"] == "n"
+
+    sql = (
+        "SELECT c.country, COUNT(*) AS orders, ROUND(AVG(o.amount), 2) AS avg_amount "
+        "FROM orders o JOIN customers c ON c.id = o.customer_id "
+        "GROUP BY c.country ORDER BY c.country"
+    )
+    grouped = call(connected, "query", {"source": "shop", "expression": sql})
+    assert grouped["columns"] == ["country", "orders", "avg_amount"]
+    assert grouped["returned"] == 3 and "more_rows" not in grouped
+    assert all(len(row) == 3 for row in grouped["rows"])
+
+
+def test_sql_values_are_not_rounded(connected) -> None:  # type: ignore[no-untyped-def]
+    # Statistics carry 3 significant figures; values asked for must not.
+    sql = "SELECT ROUND(AVG(amount), 2) AS a FROM orders WHERE customer_id % 3 = 0"
+    payload = call(connected, "query", {"source": "shop", "expression": sql})
+    assert payload["result"] != round(payload["result"])  # kept its decimals
+    rows = call(
+        connected,
+        "query",
+        {"source": "shop", "expression": "SELECT amount FROM orders WHERE id = 333"},
+    )
+    assert rows["result"] == 499.5
+
+
+def test_sql_row_cap_cannot_be_lifted(connected) -> None:  # type: ignore[no-untyped-def]
+    sql = "SELECT * FROM orders ORDER BY amount DESC LIMIT 1000"
+    payload = call(connected, "query", {"source": "shop", "expression": sql, "limit": 3})
+    assert payload["returned"] == 3 and payload["more_rows"] is True
+    assert [row[0] for row in payload["rows"]] == [499, 498, 497]
+
+
+@pytest.mark.parametrize(
+    ("sql", "code"),
+    [
+        ("DELETE FROM orders", "STATEMENT_REJECTED"),
+        ("SELECT 1; DROP TABLE orders", "STATEMENT_REJECTED"),
+        ("WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d", "STATEMENT_REJECTED"),
+        ("SELECT load_extension('evil')", "STATEMENT_REJECTED"),
+        ("SELECT * FROM missing_table", "INVALID_OPERATION"),
+        ("SELEC oops", "STATEMENT_REJECTED"),
+    ],
+)
+def test_sql_errors(connected, sql, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(connected, "query", {"source": "shop", "expression": sql})["error"]["code"] == code
+
+
+def test_sql_timeout_is_reported(shop: Path) -> None:
+    srv = build_server(
+        load_settings(log_level="WARNING", allowed_paths=[shop.parent], statement_timeout=1)
+    )
+    call(srv, "connect_database", {"alias": "shop", "dsn": dsn_for(shop)})
+    endless = (
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT COUNT(*) FROM c"
+    )
+    payload = call(srv, "query", {"source": "shop", "expression": endless})
+    assert payload["error"]["code"] == "QUERY_TIMEOUT" and payload["error"]["retryable"] is True
+
+
+def test_sql_stays_within_budget_and_changes_nothing(connected, shop: Path) -> None:  # type: ignore[no-untyped-def]
+    before = sqlite3.connect(shop).execute("SELECT COUNT(*), SUM(amount) FROM orders").fetchone()
+    payload = call(
+        connected, "query", {"source": "shop", "expression": "SELECT * FROM orders", "limit": 100}
+    )
+    assert estimate_tokens(payload) <= 500 * 1.15 and payload["more_rows"] is True
+    after = sqlite3.connect(shop).execute("SELECT COUNT(*), SUM(amount) FROM orders").fetchone()
+    assert before == after
+
+
+def test_dataset_sources_still_use_the_expression_language(connected) -> None:  # type: ignore[no-untyped-def]
+    call(connected, "load_dataset", {"source": "shop.customers"})
+    payload = call(connected, "query", {"source": "customers", "expression": "count(by=country)"})
+    assert payload["values"] == {"FR": 17, "UK": 17, "US": 16}
+    sql_on_dataset = call(connected, "query", {"source": "customers", "expression": "SELECT 1"})
+    assert sql_on_dataset["error"]["code"] == "INVALID_OPERATION"  # not SQL there

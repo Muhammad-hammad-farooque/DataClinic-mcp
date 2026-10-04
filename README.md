@@ -9,8 +9,8 @@ the result back out.
 > **Status: early alpha.** Phases 1 and 2 of 6 are complete and Phase 3
 > (databases) is under way. Ten tools work today (`load_dataset`, `profile`,
 > `find_issues`, `analyze_column`, `check_relationships`, `analyze_target`,
-> `query`, `connect_database`, `explore_schema`, `manage_sources`). SQL in
-> `query`, cleaning and output are **not implemented yet**.
+> `query`, `connect_database`, `explore_schema`, `manage_sources`). Cleaning
+> and output are **not implemented yet**.
 > See [Current state](#current-state) for exactly what runs.
 
 ---
@@ -110,7 +110,7 @@ Restart the client and the tools appear.
 | `analyze_column` | Deep dive on one column, adapted to its type. Numbers get percentiles, a histogram, a normality test and the skew left by each candidate transform, so the recommended fix names the simplest one that works. Categories get the full value list and encoding advice; dates a breakdown by year, month and weekday plus missing days; identifiers their key formats and repeated keys |
 | `check_relationships` | Ranked relationships, never a full matrix. With no arguments: the strongest pairs of any type (Pearson and Spearman for numbers, bias-corrected Cramér's V for categories, the correlation ratio for mixed pairs) plus groups of near-interchangeable columns to prune. `target=` ranks every column's link to one column; `group_by=` compares every column across groups with effect sizes |
 | `analyze_target` | Assesses a prediction target before modelling: classification or regression, class balance or skew, every feature ranked by strength, and **leakage** -- features that encode the answer, including categories that map one-to-one to classes (judged against chance, so an imbalanced target does not trigger false alarms) |
-| `query` | Asks a loaded dataset a precise question in a small, safe expression language (Python syntax, never `eval`): conditions such as `price > 100 and country == "UK"` count and list matching rows; `mean(price, by=country)` and other aggregates take `where=` and `by=`; `rows(col, ..., where=, sort=, desc=)` picks columns. Attribute access, imports, indexing and code constructs are refused. SQL against databases arrives with Phase 3 |
+| `query` | Asks a loaded dataset a precise question in a small, safe expression language (Python syntax, never `eval`): conditions such as `price > 100 and country == "UK"` count and list matching rows; `mean(price, by=country)` and other aggregates take `where=` and `by=`; `rows(col, ..., where=, sort=, desc=)` picks columns. Attribute access, imports, indexing and code constructs are refused. On a database connection the expression is instead one read-only `SELECT`, run in the database through the SQL guard, under the statement timeout and row cap |
 | `connect_database` | Opens a **read-only** connection to a SQLite file or PostgreSQL database and reports dialect, version, schemas and table count. Credentials come from the environment, never echoed back |
 | `explore_schema` | Browses a connection step by step: schemas, then tables with row estimates, then one table's columns, keys and indexes |
 | `manage_sources` | Lists what is open in the session, or closes one to free memory |
@@ -254,7 +254,7 @@ contain values from your data.
 |---|---|---|
 | 1 | Config, errors, logging, registry, loaders, budgeting, `load_dataset` | **done** |
 | 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | **done** |
-| 3 | Database read path — SQLite and PostgreSQL first, push-down profiling, SQL in `query` | in progress (guard, `connect_database`, `explore_schema`, loading tables, push-down `profile` done) |
+| 3 | Database read path — SQLite and PostgreSQL first, push-down profiling, SQL in `query` | in progress (all but the live-PostgreSQL CI job done) |
 | 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | planned |
 | 5 | `plot`, `generate`, `export`, MCP resources | planned |
 | 6 | Cost benchmark, performance gates, docs | planned |

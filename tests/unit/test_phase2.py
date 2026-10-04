@@ -1033,3 +1033,23 @@ def test_query_errors_are_envelopes(server, args, code) -> None:  # type: ignore
 def test_query_suggests_the_column_meant(server) -> None:  # type: ignore[no-untyped-def]
     payload = call(server, "query", {"source": "m", "expression": "prices > 1"})
     assert "price" in payload["error"]["remedy"]
+
+
+def test_query_rows_keep_their_precision(server, messy: pd.DataFrame) -> None:  # type: ignore[no-untyped-def]
+    """Row values are data: revenue 20,281.33 must not be shown as 20,300."""
+    payload = call(
+        server,
+        "query",
+        {"source": "m", "expression": "rows(revenue, where=revenue > 0)", "limit": 5},
+    )
+    shown = [row[0] for row in payload["rows"]]
+    expected = messy.loc[messy.revenue > 0, "revenue"].head(5).tolist()
+    assert shown == pytest.approx(expected, rel=1e-12)
+
+
+def test_statistics_still_carry_three_significant_figures() -> None:
+    assert compact({"mean": 1234.56, "rows": [[1234.56]], "result": 0.1 + 0.2}) == {
+        "mean": 1230,
+        "rows": [[1234.56]],
+        "result": 0.3,
+    }

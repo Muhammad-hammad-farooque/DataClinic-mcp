@@ -80,6 +80,13 @@ def round_sig(value: float | int | None, digits: int = 3) -> float | int | None:
     return rounded
 
 
+# Values a caller asked for directly -- query rows and results -- are data,
+# not statistics: rounding 1234.56 to 1230 would misreport them. They keep
+# full precision, trimmed only of float noise (0.30000000000000004 -> 0.3).
+PRECISE_KEYS = frozenset({"rows", "result"})
+PRECISE_DIGITS = 12
+
+
 def compact(obj: Any, digits: int = 3) -> Any:
     """Recursively drop empty values and round floats.
 
@@ -87,11 +94,12 @@ def compact(obj: Any, digits: int = 3) -> Any:
     ``False`` and ``0`` are kept: they are answers, not absences. Inside a
     list, ``None`` is kept: there position carries meaning, and dropping a
     null would shift every later value under the wrong column header.
+    Floats under ``PRECISE_KEYS`` keep ``PRECISE_DIGITS`` significant figures.
     """
     if isinstance(obj, dict):
         out = {}
         for key, value in obj.items():
-            cleaned = compact(value, digits)
+            cleaned = compact(value, PRECISE_DIGITS if key in PRECISE_KEYS else digits)
             if cleaned is None:
                 continue
             if isinstance(cleaned, (str, list, dict, tuple)) and len(cleaned) == 0:

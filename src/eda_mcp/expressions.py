@@ -30,7 +30,7 @@ import numpy as np
 import pandas as pd
 from pandas.api import types as pdt
 
-from eda_mcp.digest import estimate_tokens, round_sig
+from eda_mcp.digest import estimate_tokens
 from eda_mcp.errors import EDAError, ErrorCode, OperationRefusedError
 
 MAX_LENGTH = 2_000
@@ -524,7 +524,8 @@ def jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         value = value.item()
     if isinstance(value, float):
-        return round_sig(value) if math.isfinite(value) else None
+        # Precision is the encoder's decision (digest.compact), not the cell's.
+        return value if math.isfinite(value) else None
     if isinstance(value, str) and len(value) > MAX_CELL_CHARS:
         return value[: MAX_CELL_CHARS - 1] + "…"
     if isinstance(value, (bool, int, str)):
@@ -532,7 +533,7 @@ def jsonable(value: Any) -> Any:
     return jsonable(str(value))
 
 
-def _listing(frame: pd.DataFrame, limit: int, budget: int) -> tuple[dict[str, Any], int]:
+def listing(frame: pd.DataFrame, limit: int, budget: int) -> tuple[dict[str, Any], int]:
     """Rows as a header plus value lists, cut whole-row at the budget."""
     columns = [str(c) for c in frame.columns]
     out: dict[str, Any] = {"columns": columns, "rows": []}
@@ -559,8 +560,8 @@ def present(
         result = Rows(df[result.fillna(False).astype(bool)], int(result.fillna(False).sum()))
 
     if isinstance(result, Rows):
-        listing, shown = _listing(result.frame, limit, room)
-        body = {"matched": result.matched, "of": rows, **listing}
+        rows_out, shown = listing(result.frame, limit, room)
+        body = {"matched": result.matched, "of": rows, **rows_out}
         summary = f"{result.matched:,} of {rows:,} rows match ({result.matched / rows:.1%})"
         if shown < result.matched:
             summary += f"; showing the first {shown}"
@@ -602,6 +603,27 @@ def present(
     return {"result": value}, f"{expression} = {value}"
 
 
+def present_sql(
+    frame: pd.DataFrame, more: bool, limit: int, budget: int
+) -> tuple[dict[str, Any], str]:
+    """Shape a SQL result: a single value as itself, anything else as rows.
+
+    The total row count is not known -- counting would run the query twice --
+    so the response says only whether more rows exist than were returned.
+    """
+    if frame.shape == (1, 1) and not more:
+        value = jsonable(frame.iloc[0, 0])
+        return {"column": str(frame.columns[0]), "result": value}, f"{frame.columns[0]} = {value}"
+
+    rows_out, shown = listing(frame, limit, int(budget * ROWS_SHARE))
+    body: dict[str, Any] = {**rows_out, "returned": shown}
+    summary = f"{shown} row(s)"
+    if more or shown < len(frame):
+        body["more_rows"] = True
+        summary += "; more exist -- aggregate in SQL, or raise limit= (up to 100)"
+    return body, summary + "."
+
+
 def evaluate(df: pd.DataFrame, expression: str) -> Result:
     """Parse and evaluate *expression* against *df* without ``eval``."""
     if len(expression) > MAX_LENGTH:
@@ -631,4 +653,4 @@ def evaluate(df: pd.DataFrame, expression: str) -> Result:
     return _Evaluator(df, aliases).visit(tree)
 
 
-__all__ = ["FUNCTIONS", "Grouped", "Rows", "evaluate", "present"]
+__all__ = ["FUNCTIONS", "Grouped", "Rows", "evaluate", "listing", "present", "present_sql"]
