@@ -69,6 +69,7 @@ Optional format support:
 ```bash
 uv sync --extra excel      # .xlsx, .xls
 uv sync --extra parquet    # .parquet
+uv sync --extra sql        # SQL guard and database access (Phase 3, in progress)
 ```
 
 ## Connect it
@@ -248,8 +249,8 @@ contain values from your data.
 ## Development
 
 ```bash
-uv sync --group dev
-uv run pytest                       # 38 tests
+uv sync --group dev --extra sql --extra duckdb
+uv run pytest                       # unit + adversarial suites
 uv run pytest --cov=eda_mcp         # coverage
 uv run ruff check src tests         # lint
 uv run ruff format src tests        # format

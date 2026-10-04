@@ -195,6 +195,17 @@ class OperationRefusedError(EDAError):
         super().__init__(ErrorCode.OPERATION_REFUSED, f"refused {what}: {why}", instead)
 
 
+class StatementRejectedError(EDAError):
+    """SQL refused by the statement guard before reaching a driver (spec 6.3)."""
+
+    def __init__(self, why: str) -> None:
+        super().__init__(
+            ErrorCode.STATEMENT_REJECTED,
+            f"SQL rejected: {why}",
+            "send a single read-only SELECT (or WITH ... SELECT) statement",
+        )
+
+
 class MemoryLimitExceededError(EDAError):
     def __init__(self, needed_mb: float, limit_mb: int) -> None:
         super().__init__(

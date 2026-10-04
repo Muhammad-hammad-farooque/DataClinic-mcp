@@ -33,7 +33,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: true
-      - run: uv sync --locked
+      - run: uv sync --locked --extra sql --extra duckdb
       - run: uv run mypy src
 
   test:
@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
-      - run: uv sync --locked
+      - run: uv sync --locked --extra sql --extra duckdb
       - run: uv run pytest -m "not integration and not slow"
 
   security:
