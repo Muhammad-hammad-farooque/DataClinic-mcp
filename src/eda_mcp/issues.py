@@ -63,11 +63,32 @@ ONE_HOT_LEVELS = 15
 SHORT_LABEL_CHARS = 30
 
 
-def _missing(profile: ColumnProfile, relation: str | None) -> Finding | None:
+# The column clean_data's flag_missing (and fill_missing flag=True) adds.
+FLAG_SUFFIX = "_was_missing"
+
+
+def flagged_columns(names: list[str]) -> set[str]:
+    """Columns whose missingness is already recorded in a ``<name>_was_missing`` flag."""
+    present = set(names)
+    return {name for name in present if f"{name}{FLAG_SUFFIX}" in present}
+
+
+def _missing(profile: ColumnProfile, relation: str | None, flagged: bool = False) -> Finding | None:
     total = profile.count + profile.missing
     if not total or not profile.missing or profile.kind is ColumnKind.EMPTY:
         return None
     share = profile.missing / total
+    if flagged:
+        # The signal is already kept: what remains is an ordinary imputation,
+        # and recommending the flag again would send the caller in a circle.
+        fill = "median" if profile.kind is ColumnKind.NUMERIC else "mode"
+        return Finding(
+            Severity.LOW,
+            f"{share:.0%} missing, flagged in {profile.name}{FLAG_SUFFIX}",
+            column=profile.name,
+            recommendation=f"impute with the {fill}; the flag keeps the signal",
+            affected_rows=profile.missing,
+        )
     if share >= MISSING_HIGH:
         severity, advice = Severity.HIGH, "add a missingness flag rather than imputing"
     elif share >= MISSING_MEDIUM:
@@ -317,7 +338,9 @@ def _datetime(profile: ColumnProfile) -> list[Finding]:
     return findings
 
 
-def column_findings(profile: ColumnProfile, missing_relation: str | None = None) -> list[Finding]:
+def column_findings(
+    profile: ColumnProfile, missing_relation: str | None = None, flagged: bool = False
+) -> list[Finding]:
     """Everything wrong with one column, each with a single recommended fix.
 
     *missing_relation* describes what the column's gaps depend on, from
@@ -339,7 +362,7 @@ def column_findings(profile: ColumnProfile, missing_relation: str | None = None)
         return [Finding(Severity.HIGH, "entirely empty", column=name, recommendation="drop")]
 
     findings: list[Finding] = []
-    missing = _missing(profile, missing_relation)
+    missing = _missing(profile, missing_relation, flagged)
     if missing:
         findings.append(missing)
 
@@ -579,15 +602,20 @@ def find_issues(
     if not rows:
         return findings
 
+    # A flagged column's missingness trivially "follows" its own flag; it
+    # needs no relationship test.
+    flagged = flagged_columns([str(c) for c in df.columns])
     targets = [
         p.name
         for p in profiles
-        if p.kind is not ColumnKind.EMPTY and p.missing >= MISSING_LOW * rows
+        if p.kind is not ColumnKind.EMPTY
+        and p.missing >= MISSING_LOW * rows
+        and p.name not in flagged
     ]
     relations = missingness_relations(df, kinds, targets)
 
     for p in profiles:
-        findings.extend(column_findings(p, relations.get(p.name)))
+        findings.extend(column_findings(p, relations.get(p.name), p.name in flagged))
     findings.extend(_duplicate_columns(df, profiles))
     repeated = _repeated_records(df, kinds)
     if repeated:
@@ -620,9 +648,11 @@ def needs_attention(findings: list[Finding]) -> bool:
 
 
 __all__ = [
+    "FLAG_SUFFIX",
     "column_findings",
     "encoding_advice",
     "find_issues",
+    "flagged_columns",
     "frame_findings",
     "missingness_relations",
     "needs_attention",

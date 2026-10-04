@@ -37,7 +37,7 @@ from eda_mcp.errors import (
 )
 from eda_mcp.loaders import detect_delimiter, detect_encoding, load_file
 from eda_mcp.profiling import ColumnKind, classify, column_kinds, orientation
-from eda_mcp.registry import Registry
+from eda_mcp.registry import Operation, Registry
 from eda_mcp.server import build_server, default_alias
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
@@ -299,21 +299,39 @@ def test_unique_alias_avoids_collisions() -> None:
     assert registry.unique_alias("data") == "data_3"
 
 
+def _op(name: str, before: int, after: int) -> Operation:
+    return Operation(name, {}, before, after, 1, 1)
+
+
 def test_undo_restores_previous_frame() -> None:
     registry = Registry()
     dataset = registry.add_dataset("d", pd.DataFrame({"a": [1, 2, 3]}), origin="x")
-    dataset.snapshot(max_total_mb=100)
-    dataset.df = dataset.df.head(1)
+    dataset.commit(dataset.df.head(1), _op("trim", 3, 1), max_total_mb=100)
     assert dataset.shape == (1, 1)
     assert dataset.restore() == 1
-    assert dataset.shape == (3, 1)
+    assert dataset.shape == (3, 1) and dataset.history == []
 
 
 def test_snapshots_disabled_when_budget_is_zero() -> None:
     registry = Registry()
     dataset = registry.add_dataset("d", pd.DataFrame({"a": [1]}), origin="x")
-    dataset.snapshot(max_total_mb=0)
+    dataset.commit(dataset.df.copy(), _op("noop", 1, 1), max_total_mb=0)
     assert dataset.snapshots == []
+    assert dataset.history[0].undoable is False
+    assert dataset.restore() == 0
+
+
+def test_evicted_snapshots_mark_exactly_their_operations() -> None:
+    """With depth 2, a third change makes the first one irreversible -- and says so."""
+    dataset = Registry().add_dataset("d", pd.DataFrame({"a": list(range(10))}), origin="x")
+    for i in range(3):
+        dataset.commit(
+            dataset.df.iloc[1:], _op(f"step{i}", 10 - i, 9 - i), max_total_mb=100, max_depth=2
+        )
+    assert [op.undoable for op in dataset.history] == [False, True, True]
+    assert dataset.restore(steps=5) == 2  # only what is genuinely reversible
+    assert dataset.shape == (9, 1)  # back to just after step0, which cannot be undone
+    assert [op.name for op in dataset.history] == ["step0"]
 
 
 # --------------------------------------------------------------------------
@@ -340,6 +358,8 @@ def test_tools_registered_with_annotations(settings: Settings) -> None:
         "query": (True, True),
         "connect_database": (True, True),
         "explore_schema": (True, True),
+        "clean_data": (False, None),
+        "history": (False, None),
     }
     assert set(tools) == set(expected)
     for name, (read_only, open_world) in expected.items():

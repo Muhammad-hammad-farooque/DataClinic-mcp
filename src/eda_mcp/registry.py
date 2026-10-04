@@ -64,29 +64,35 @@ class Dataset:
     def bytes(self) -> int:
         return int(self.df.memory_usage(deep=True).sum())
 
-    def snapshot(self, max_total_mb: int, max_depth: int = 10) -> None:
-        """Record the current frame so the next mutation can be undone.
+    def commit(
+        self,
+        frame: pd.DataFrame,
+        operation: Operation,
+        max_total_mb: int,
+        max_depth: int = 10,
+    ) -> None:
+        """Replace the frame, recording the old one so the change can be undone.
 
-        Eviction is visible rather than silent: when the budget is exhausted
-        the oldest entry is dropped and its history record is marked
-        ``undoable: false``, so ``history`` never claims a reversal it cannot
-        perform.
+        Snapshots pair with the *newest* history entries: the last
+        ``len(snapshots)`` operations are undoable, every earlier one is not.
+        When the count or byte budget is exceeded the oldest snapshot is
+        evicted and its operation marked ``undoable: false``, so ``history``
+        never claims a reversal it cannot perform. With a zero budget nothing
+        is kept and the operation is recorded as not undoable at once.
         """
-        if max_total_mb <= 0:
-            return
-        self.snapshots.append(self.df.copy(deep=True))
+        if max_total_mb > 0:
+            self.snapshots.append(self.df)  # the frame being replaced; never mutated in place
+        self.df = frame
+        self.history.append(operation)
 
         limit = max_total_mb * 1024 * 1024
-        while self.snapshots and (
-            len(self.snapshots) > max_depth
-            or sum(int(s.memory_usage(deep=True).sum()) for s in self.snapshots) > limit
+        while len(self.snapshots) > max_depth or (
+            len(self.snapshots) > 1
+            and sum(int(s.memory_usage(deep=True).sum()) for s in self.snapshots) > limit
         ):
             self.snapshots.pop(0)
-            dropped = len(self.history) - len(self.snapshots)
-            for op in self.history[:dropped]:
-                op.undoable = False
-            if len(self.snapshots) <= 1:
-                break
+        for op in self.history[: len(self.history) - len(self.snapshots)]:
+            op.undoable = False
 
     def restore(self, steps: int = 1) -> int:
         """Roll back up to *steps* mutations. Returns how many were undone."""

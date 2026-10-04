@@ -6,11 +6,12 @@ An MCP server that lets an AI assistant run a full exploratory data analysis
 workflow — inspect a dataset, diagnose what is wrong with it, fix it, and write
 the result back out.
 
-> **Status: early alpha.** Phases 1–3 of 6 are complete. Ten tools work today
-> (`load_dataset`, `profile`, `find_issues`, `analyze_column`,
-> `check_relationships`, `analyze_target`, `query`, `connect_database`,
-> `explore_schema`, `manage_sources`), on files, SQLite and PostgreSQL.
-> Cleaning and output are **not implemented yet**. See
+> **Status: early alpha.** Phases 1–3 of 6 are complete and Phase 4 (cleaning)
+> is under way. Twelve tools work today (`load_dataset`, `profile`,
+> `find_issues`, `analyze_column`, `check_relationships`, `analyze_target`,
+> `query`, `connect_database`, `explore_schema`, `clean_data`, `history`,
+> `manage_sources`), on files, SQLite and PostgreSQL. Transforms, reshaping,
+> rule validation and output are **not implemented yet**. See
 > [Current state](#current-state) for exactly what runs.
 
 ---
@@ -113,6 +114,8 @@ Restart the client and the tools appear.
 | `query` | Asks a loaded dataset a precise question in a small, safe expression language (Python syntax, never `eval`): conditions such as `price > 100 and country == "UK"` count and list matching rows; `mean(price, by=country)` and other aggregates take `where=` and `by=`; `rows(col, ..., where=, sort=, desc=)` picks columns. Attribute access, imports, indexing and code constructs are refused. On a database connection the expression is instead one read-only `SELECT`, run in the database through the SQL guard, under the statement timeout and row cap |
 | `connect_database` | Opens a **read-only** connection to a SQLite file or PostgreSQL database and reports dialect, version, schemas and table count. Credentials come from the environment, never echoed back |
 | `explore_schema` | Browses a connection step by step: schemas, then tables with row estimates, then one table's columns, keys and indexes |
+| `clean_data` | Applies a batch of cleaning operations as **one undoable step**: fill, flag or drop missing values, drop duplicates/columns/rows (`where=` uses the `query` language), remove/clip/flag outliers, replace values, merge spelling variants, rename, cast, strip whitespace, standardise case, parse dates. A malformed batch changes nothing; an operation the safety policy refuses (dropping over half the rows, imputing a column over 60% missing, dropping columns holding over 90% of the data) is skipped and reported with its reason. Returns what changed, never a re-profile |
+| `history` | Lists a dataset's changes this session, or undoes the last `steps=` of them. Snapshots are bounded by `EDA_MCP_MAX_SNAPSHOT_MB`, and a change whose snapshot was evicted is shown as not undoable |
 | `manage_sources` | Lists what is open in the session, or closes one to free memory |
 
 `load_dataset` returns a profile in its first response, so there is no need for
@@ -136,8 +139,8 @@ mistaken for a key.
 
 ### Not built yet
 
-`validate_rules` · `clean_data` ·
-`transform_data` · `reshape_data` · `history` · `plot` · `generate` · `export`
+`validate_rules` · `transform_data` · `reshape_data` · `plot` · `generate` ·
+`export`
 · database connectivity
 
 These are specified in [`speckit.md`](speckit.md) but not implemented. The
@@ -255,7 +258,7 @@ contain values from your data.
 | 1 | Config, errors, logging, registry, loaders, budgeting, `load_dataset` | **done** |
 | 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | **done** |
 | 3 | Database read path — SQLite and PostgreSQL first, push-down profiling, SQL in `query` | **done** |
-| 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | planned |
+| 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | in progress (`clean_data`, `history` done) |
 | 5 | `plot`, `generate`, `export`, MCP resources | planned |
 | 6 | Cost benchmark, performance gates, docs | planned |
 

@@ -36,6 +36,7 @@ from eda_mcp.instructions import INSTRUCTIONS
 from eda_mcp.issues import (
     column_findings,
     encoding_advice,
+    flagged_columns,
     frame_findings,
     missingness_relations,
     needs_attention,
@@ -43,6 +44,8 @@ from eda_mcp.issues import (
 from eda_mcp.issues import find_issues as detect_issues
 from eda_mcp.loaders import load_file
 from eda_mcp.logging import configure, get_logger, new_correlation_id, tool_call
+from eda_mcp.mutations import OPERATIONS as CLEANING
+from eda_mcp.mutations import apply as apply_operations
 from eda_mcp.profiling import (
     ColumnKind,
     column_kinds,
@@ -54,6 +57,7 @@ from eda_mcp.profiling import (
 )
 from eda_mcp.profiling import analyze_column as deep_profile
 from eda_mcp.registry import Connection, Registry
+from eda_mcp.registry import Operation as HistoryEntry
 from eda_mcp.relations import (
     MAX_GROUPS,
     REPORT_STRENGTH,
@@ -288,7 +292,10 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                         table_findings = frame_findings(measured.frame)
                         duplicates = int(duplicated(measured.frame).sum())
 
-                by_column = {p.name: column_findings(p) for p in profiles}
+                flagged = flagged_columns(list(kinds))
+                by_column = {
+                    p.name: column_findings(p, flagged=p.name in flagged) for p in profiles
+                }
                 findings = list(table_findings)
                 findings.extend(f for fs in by_column.values() for f in fs)
 
@@ -784,6 +791,162 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                 response = Response("explore_schema", body=body)
                 response.summary = summary
                 record["level"] = "table" if table else ("schema" if schema else "database")
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    def run_mutation(
+        tool: str, alias: str, operations: list[dict[str, Any]], table: Any
+    ) -> dict[str, Any]:
+        """Apply a batch, commit it as one undoable step, and report the delta.
+
+        The response is what changed -- never a re-profile (spec 7.3).
+        Refused operations become findings with their reasons (spec 12.2).
+        """
+        dataset = registry.get_dataset(alias)
+        rows_before, cols_before = dataset.shape
+        frame, outcomes = apply_operations(dataset.df, operations, table)
+        applied = [o for o in outcomes if o.refused is None]
+        if applied:
+            dataset.commit(
+                frame,
+                HistoryEntry(
+                    tool,
+                    {"operations": [o.describe() for o in applied]},
+                    rows_before,
+                    int(frame.shape[0]),
+                    cols_before,
+                    int(frame.shape[1]),
+                ),
+                settings.max_snapshot_mb,
+            )
+        rows_after, cols_after = dataset.shape
+
+        body: dict[str, Any] = {
+            "dataset": alias,
+            "shape_before": [rows_before, cols_before],
+            "shape_after": [rows_after, cols_after],
+            "applied": [o.describe() for o in applied],
+        }
+        response = Response(tool, body=body)
+        for outcome in outcomes:
+            if outcome.refused is not None:
+                response.add(
+                    Finding(
+                        Severity.MEDIUM,
+                        f"refused {outcome.op} {outcome.target}: {outcome.refused.reason}".replace(
+                            "  ", " "
+                        ),
+                        recommendation=outcome.refused.instead,
+                    )
+                )
+            elif outcome.note:
+                response.add(Finding(Severity.INFO, f"{outcome.op}: {outcome.note}"))
+
+        summary = (
+            f"{len(applied)} of {len(outcomes)} operation(s) applied; "
+            f"rows {rows_before:,} -> {rows_after:,}, columns {cols_before} -> {cols_after}."
+        )
+        if applied:
+            undoable = dataset.history[-1].undoable
+            summary += (
+                " Undo with history(action='undo')."
+                if undoable
+                else " Not undoable: EDA_MCP_MAX_SNAPSHOT_MB is 0."
+            )
+        response.summary = summary
+        return response.build()
+
+    @server.tool(
+        name="clean_data",
+        description=(
+            "Clean a loaded dataset with a batch of operations, applied as one undoable "
+            "step. Each is an object with op= and its parameters: fill_missing, "
+            "flag_missing, drop_missing, drop_duplicates, drop_columns, drop_rows "
+            '(where="age < 0"), remove_outliers, replace_values (mapping={"-999": null}), '
+            "merge_variants, rename_columns, cast_type, strip_whitespace, "
+            "standardize_case, parse_dates. Batch the fixes find_issues recommends into "
+            "one call. Sources on disk or in a database are never modified."
+        ),
+        annotations=MUTATING,
+    )
+    def clean_data(alias: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
+        try:
+            with tool_call("clean_data", alias=alias, operations=len(operations or [])):
+                return run_mutation("clean_data", alias, operations, CLEANING)
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
+        name="history",
+        description=(
+            "List the changes made to a dataset this session, or undo the last "
+            "steps= of them. Each clean_data / transform_data / reshape_data call "
+            "is one step."
+        ),
+        annotations=MUTATING,
+    )
+    def history(alias: str, action: str = "list", steps: int = 1) -> dict[str, Any]:
+        try:
+            with tool_call("history", alias=alias, action=action) as record:
+                dataset = registry.get_dataset(alias)
+                body: dict[str, Any] = {"dataset": alias}
+                if action == "list":
+                    entries = {
+                        str(i + 1): {
+                            "tool": op.name,
+                            "change": op.describe(),
+                            "operations": op.params.get("operations"),
+                            "undoable": op.undoable,
+                        }
+                        for i, op in enumerate(dataset.history)
+                    }
+                    kept, cut = fit(entries, int(DEFAULT_BUDGET * 0.8))
+                    body.update({"shape": list(dataset.shape), "steps": kept})
+                    if cut:
+                        body["more_steps"] = len(cut)
+                    undoable = sum(1 for op in dataset.history if op.undoable)
+                    summary = (
+                        f"{len(dataset.history)} change(s), {undoable} undoable."
+                        if dataset.history
+                        else "No changes yet; this is the data as loaded."
+                    )
+                elif action == "undo":
+                    if steps < 1:
+                        raise EDAError(
+                            ErrorCode.INVALID_OPERATION, "steps must be at least 1", "e.g. steps=1"
+                        )
+                    undone = dataset.restore(steps)
+                    if not undone:
+                        reason = (
+                            "the remaining changes can no longer be undone: their snapshots "
+                            "were evicted under EDA_MCP_MAX_SNAPSHOT_MB"
+                            if dataset.history
+                            else "there are no changes to undo"
+                        )
+                        raise EDAError(
+                            ErrorCode.INVALID_OPERATION,
+                            f"nothing undone: {reason}",
+                            "reload the source with load_dataset to start over",
+                        )
+                    body.update({"undone": undone, "shape": list(dataset.shape)})
+                    rows_now, cols_now = dataset.shape
+                    summary = f"Undid {undone} step(s); {rows_now:,} rows, {cols_now} columns now."
+                    if undone < steps:
+                        summary += f" Only {undone} of {steps} were undoable."
+                    record["undone"] = undone
+                else:
+                    raise EDAError(
+                        ErrorCode.INVALID_OPERATION,
+                        f"unknown action {action!r}",
+                        "use action='list' or action='undo'",
+                    )
+                response = Response("history", body=body)
+                response.summary = summary
                 return response.build()
         except EDAError as exc:
             return exc.to_dict()
