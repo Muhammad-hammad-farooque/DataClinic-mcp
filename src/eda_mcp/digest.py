@@ -83,8 +83,10 @@ def round_sig(value: float | int | None, digits: int = 3) -> float | int | None:
 def compact(obj: Any, digits: int = 3) -> Any:
     """Recursively drop empty values and round floats.
 
-    Empty strings, empty containers and ``None`` are removed. ``False`` and
-    ``0`` are kept: they are answers, not absences.
+    Empty strings, empty containers and ``None`` are removed from dicts.
+    ``False`` and ``0`` are kept: they are answers, not absences. Inside a
+    list, ``None`` is kept: there position carries meaning, and dropping a
+    null would shift every later value under the wrong column header.
     """
     if isinstance(obj, dict):
         out = {}
@@ -97,8 +99,7 @@ def compact(obj: Any, digits: int = 3) -> Any:
             out[key] = cleaned
         return out
     if isinstance(obj, (list, tuple)):
-        items = [compact(v, digits) for v in obj]
-        return [v for v in items if v is not None]
+        return [compact(v, digits) for v in obj]
     if isinstance(obj, float):
         return round_sig(obj, digits)
     return obj

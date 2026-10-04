@@ -909,3 +909,127 @@ def test_analyze_target_identical_on_sorted_copy(settings: Settings) -> None:
 )
 def test_analyze_target_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
     assert call(server, "analyze_target", args)["error"]["code"] == code
+
+
+# --------------------------------------------------------------------------
+# query
+
+
+def test_compact_keeps_nulls_inside_lists() -> None:
+    # A dropped null would shift every later value under the wrong header.
+    assert compact({"row": ["a", None, 1.23456], "gone": None}) == {"row": ["a", None, 1.23]}
+
+
+def test_query_conditions_match_pandas(messy: pd.DataFrame) -> None:
+    from eda_mcp.expressions import evaluate
+
+    cases = {
+        'price > 100 and country == "UK"': (messy.price > 100) & (messy.country == "UK"),
+        "18 <= age < 30": (messy.age >= 18) & (messy.age < 30),
+        'country in ["UK", "uk"]': messy.country.isin(["UK", "uk"]),
+        "isnull(country) | (price > 50)": messy.country.isna() | (messy.price > 50),
+        "not (price > 10)": ~(messy.price > 10),
+        'contains(country, "u", case=False)': messy.country.str.contains("u", case=False),
+    }
+    for expression, expected in cases.items():
+        result = evaluate(messy, expression)
+        assert int(result.fillna(False).sum()) == int(expected.fillna(False).sum()), expression
+
+
+def test_query_aggregates_match_pandas(messy: pd.DataFrame) -> None:
+    from eda_mcp.expressions import Grouped, evaluate
+
+    assert evaluate(messy, "count(where=revenue > 50000)") == int((messy.revenue > 50000).sum())
+    assert evaluate(messy, "quantile(price, 0.9)") == pytest.approx(messy.price.quantile(0.9))
+    assert evaluate(messy, "mean(churned)") == pytest.approx(messy.churned.mean())
+
+    grouped = evaluate(messy, "mean(price, by=country, where=age > 30)")
+    assert isinstance(grouped, Grouped)
+    expected = messy[messy.age > 30].groupby("country").price.mean()
+    assert grouped.values.to_dict() == pytest.approx(expected.to_dict())
+    assert list(grouped.values) == sorted(grouped.values, reverse=True)  # largest first
+
+
+def test_query_tool_shapes_each_result(server) -> None:  # type: ignore[no-untyped-def]
+    rows = call(server, "query", {"source": "m", "expression": "age < 0", "limit": 5})
+    assert rows["matched"] == 52 and len(rows["rows"]) == 5
+    # every row lines up with the header, missing cells included
+    assert all(len(r) == len(rows["columns"]) for r in rows["rows"])
+    assert rows["rows"][0][rows["columns"].index("notes")] is None
+
+    picked = call(
+        server,
+        "query",
+        {
+            "source": "m",
+            "expression": "rows(price, country, where=age < 0, sort=price, desc=True)",
+            "limit": 3,
+        },
+    )
+    assert picked["columns"] == ["price", "country"]
+    prices = [r[0] for r in picked["rows"]]
+    assert prices == sorted(prices, reverse=True)
+
+    groups = call(server, "query", {"source": "m", "expression": "count(by=year(signup_date))"})
+    assert groups["groups"] == 3 and sum(groups["values"].values()) == 5150
+
+    column = call(server, "query", {"source": "m", "expression": "log1p(price)"})
+    assert column["count"] == 5150 and "mean" in column
+
+    scalar = call(server, "query", {"source": "m", "expression": "nunique(country)"})
+    assert scalar["result"] == 6
+
+
+def test_query_backticks_name_awkward_columns(tmp_path: Path) -> None:
+    pd.DataFrame({"unit price": [1.0, 5.0, 9.0], "2024 sales": [3, 4, 5]}).to_csv(
+        tmp_path / "odd.csv", index=False
+    )
+    srv = build_server(load_settings(log_level="WARNING", allowed_paths=[tmp_path]))
+    call(srv, "load_dataset", {"source": str(tmp_path / "odd.csv"), "alias": "o"})
+    payload = call(
+        srv, "query", {"source": "o", "expression": "sum(`2024 sales`, where=`unit price` > 2)"}
+    )
+    assert payload["result"] == 9
+
+
+def test_query_stays_within_budget(server) -> None:  # type: ignore[no-untyped-def]
+    for expression in ("price > 0", "mean(price, by=customer_id)"):
+        payload = call(server, "query", {"source": "m", "expression": expression, "limit": 100})
+        assert estimate_tokens(payload) <= 500 * 1.15, expression
+
+
+def test_query_aggregates_identical_on_sorted_copy(settings: Settings) -> None:
+    srv = build_server(settings)
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy.csv"), "alias": "a"})
+    call(srv, "load_dataset", {"source": str(FIXTURES / "messy_sorted.csv"), "alias": "b"})
+    for expression in (
+        "mean(price, by=country)",
+        "count(where=age < 0)",
+        "quantile(revenue, 0.25)",
+    ):
+        a = call(srv, "query", {"source": "a", "expression": expression})
+        b = call(srv, "query", {"source": "b", "expression": expression})
+        a.pop("dataset"), b.pop("dataset")
+        assert a == b, expression
+
+
+@pytest.mark.parametrize(
+    ("args", "code"),
+    [
+        ({"source": "m", "expression": "prices > 1"}, "INVALID_OPERATION"),
+        ({"source": "m", "expression": "price > "}, "INVALID_OPERATION"),
+        ({"source": "m", "expression": "price > 'abc'"}, "INVALID_OPERATION"),
+        ({"source": "m", "expression": "mean(price, colour=1)"}, "INVALID_OPERATION"),
+        ({"source": "m", "expression": "price > 1", "limit": 0}, "INVALID_OPERATION"),
+        ({"source": "m", "expression": "price > 1", "limit": 101}, "INVALID_OPERATION"),
+        ({"source": "m", "expression": "price.__class__"}, "OPERATION_REFUSED"),
+        ({"source": "nope", "expression": "price > 1"}, "SOURCE_NOT_FOUND"),
+    ],
+)
+def test_query_errors_are_envelopes(server, args, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(server, "query", args)["error"]["code"] == code
+
+
+def test_query_suggests_the_column_meant(server) -> None:  # type: ignore[no-untyped-def]
+    payload = call(server, "query", {"source": "m", "expression": "prices > 1"})
+    assert "price" in payload["error"]["remedy"]

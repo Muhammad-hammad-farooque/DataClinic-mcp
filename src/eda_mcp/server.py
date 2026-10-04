@@ -18,8 +18,9 @@ from mcp.types import ToolAnnotations
 
 from eda_mcp import __version__
 from eda_mcp.config import Settings, load_settings
-from eda_mcp.digest import BUDGETS, Finding, Response, Severity, fit
+from eda_mcp.digest import BUDGETS, DEFAULT_BUDGET, Finding, Response, Severity, fit
 from eda_mcp.errors import ColumnNotFoundError, EDAError, ErrorCode, SourceTooLargeError
+from eda_mcp.expressions import evaluate, present
 from eda_mcp.instructions import INSTRUCTIONS
 from eda_mcp.issues import (
     column_findings,
@@ -67,6 +68,8 @@ DETAIL_LEVELS = ("brief", "standard", "full")
 # a fixed share of the budget and findings absorb the rest.
 PROFILE_COLUMN_SHARE = 0.6
 ROLLUP_NAMES = 20
+# Most rows query lists; beyond this an aggregate answers better.
+MAX_QUERY_ROWS = 100
 # Kinds that can be related to others, and kinds that can split rows into groups.
 RELATABLE_KINDS = (
     ColumnKind.NUMERIC,
@@ -510,6 +513,50 @@ def build_server(settings: Settings | None = None) -> MCPServer:
 
                 record["task"] = task
                 record["leaks"] = len(report.leaks)
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
+        name="query",
+        description=(
+            "Ask a loaded dataset a precise question with a safe expression (Python "
+            'syntax, no code execution). A condition -- price > 100 and country == "UK" '
+            "-- counts and lists matching rows. Aggregates: count, sum, mean, median, "
+            "min, max, std, nunique, quantile, each with where= and by=, e.g. "
+            "mean(price, by=country). rows(col, ..., where=, sort=, desc=) picks columns. "
+            "Quote names with spaces in backticks."
+        ),
+        annotations=READ_ONLY_EXTERNAL,
+    )
+    def query(source: str, expression: str, limit: int = 20) -> dict[str, Any]:
+        try:
+            # The expression itself is not logged: it can quote data values.
+            with tool_call("query", source=source, expression_chars=len(expression)) as record:
+                if not 1 <= limit <= MAX_QUERY_ROWS:
+                    raise EDAError(
+                        ErrorCode.INVALID_OPERATION,
+                        f"limit must be between 1 and {MAX_QUERY_ROWS}",
+                        "use an aggregate with by= to summarise more rows than that",
+                    )
+                df = registry.get_dataset(source).df
+                try:
+                    result = evaluate(df, expression)
+                except (TypeError, ValueError) as exc:
+                    # pandas rejecting an operation is the caller's to fix, not a bug.
+                    raise EDAError(
+                        ErrorCode.INVALID_OPERATION,
+                        f"could not evaluate the expression: {str(exc)[:200]}",
+                        "check that each operation suits the column's type",
+                    ) from None
+
+                budget = BUDGETS.get("query", DEFAULT_BUDGET)
+                body, summary = present(result, df, expression, limit, budget)
+                response = Response("query", body={"dataset": source, **body})
+                response.summary = summary
+                record["result"] = type(result).__name__
                 return response.build()
         except EDAError as exc:
             return exc.to_dict()

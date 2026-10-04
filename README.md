@@ -6,11 +6,10 @@ An MCP server that lets an AI assistant run a full exploratory data analysis
 workflow — inspect a dataset, diagnose what is wrong with it, fix it, and write
 the result back out.
 
-> **Status: early alpha.** Phase 1 of 6 is complete and Phase 2 is under way.
-> Seven tools work today (`load_dataset`, `profile`, `find_issues`,
-> `analyze_column`, `check_relationships`, `analyze_target`,
-> `manage_sources`). `query`, cleaning and database support are **not
-> implemented yet**. See
+> **Status: early alpha.** Phases 1 and 2 of 6 are complete. Eight tools work
+> today (`load_dataset`, `profile`, `find_issues`, `analyze_column`,
+> `check_relationships`, `analyze_target`, `query`, `manage_sources`).
+> Cleaning, database support and output are **not implemented yet**. See
 > [Current state](#current-state) for exactly what runs.
 
 ---
@@ -109,6 +108,7 @@ Restart the client and the tools appear.
 | `analyze_column` | Deep dive on one column, adapted to its type. Numbers get percentiles, a histogram, a normality test and the skew left by each candidate transform, so the recommended fix names the simplest one that works. Categories get the full value list and encoding advice; dates a breakdown by year, month and weekday plus missing days; identifiers their key formats and repeated keys |
 | `check_relationships` | Ranked relationships, never a full matrix. With no arguments: the strongest pairs of any type (Pearson and Spearman for numbers, bias-corrected Cramér's V for categories, the correlation ratio for mixed pairs) plus groups of near-interchangeable columns to prune. `target=` ranks every column's link to one column; `group_by=` compares every column across groups with effect sizes |
 | `analyze_target` | Assesses a prediction target before modelling: classification or regression, class balance or skew, every feature ranked by strength, and **leakage** -- features that encode the answer, including categories that map one-to-one to classes (judged against chance, so an imbalanced target does not trigger false alarms) |
+| `query` | Asks a loaded dataset a precise question in a small, safe expression language (Python syntax, never `eval`): conditions such as `price > 100 and country == "UK"` count and list matching rows; `mean(price, by=country)` and other aggregates take `where=` and `by=`; `rows(col, ..., where=, sort=, desc=)` picks columns. Attribute access, imports, indexing and code constructs are refused. SQL against databases arrives with Phase 3 |
 | `manage_sources` | Lists what is open in the session, or closes one to free memory |
 
 `load_dataset` returns a profile in its first response, so there is no need for
@@ -132,7 +132,7 @@ mistaken for a key.
 
 ### Not built yet
 
-`query` · `validate_rules` · `clean_data` ·
+`validate_rules` · `clean_data` ·
 `transform_data` · `reshape_data` · `history` · `plot` · `generate` · `export`
 · database connectivity
 
@@ -237,7 +237,7 @@ contain values from your data.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Config, errors, logging, registry, loaders, budgeting, `load_dataset` | **done** |
-| 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | in progress (all but `query` done) |
+| 2 | `profile`, `analyze_column`, `find_issues`, `check_relationships`, `analyze_target`, `query` | **done** |
 | 3 | Database read path — PostgreSQL, MySQL, SQLite, DuckDB, push-down profiling | planned |
 | 4 | `clean_data`, `transform_data`, `reshape_data`, undo, `validate_rules` | planned |
 | 5 | `plot`, `generate`, `export`, MCP resources | planned |
