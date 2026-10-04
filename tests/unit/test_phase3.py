@@ -12,6 +12,8 @@ import sqlite3
 import sys
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 
 from eda_mcp.config import Settings, load_settings
@@ -406,3 +408,158 @@ def test_existing_file_wins_over_a_connection(connected, tmp_path: Path, monkeyp
     (tmp_path / "shop.orders").write_text("not a table")
     payload = call(connected, "load_dataset", {"source": "shop.orders"})
     assert payload["error"]["code"] in ("UNSUPPORTED_FORMAT", "PATH_NOT_ALLOWED")
+
+
+# --------------------------------------------------------------------------
+# push-down profiling
+
+
+@pytest.fixture(scope="module")
+def sales(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, pd.DataFrame]:
+    """30k rows, sorted by price: big enough to force sampling at sample_size=2000."""
+    rng = np.random.default_rng(0)
+    n = 30_000
+    df = pd.DataFrame(
+        {
+            "price": np.round(rng.lognormal(3, 1, n), 2),
+            "age": rng.integers(18, 90, n).astype(float),
+            "country": rng.choice(["USA", "usa", "U.S.A.", "UK", "France"], n),
+            "created": (
+                pd.Timestamp("2020-01-01") + pd.to_timedelta(rng.integers(0, 1500, n), unit="D")
+            ).strftime("%Y-%m-%d"),
+            "region": "EMEA",
+        }
+    )
+    df.loc[rng.random(n) < 0.02, "age"] = -999
+    df.loc[rng.random(n) < 0.1, "price"] = np.nan
+    df = df.sort_values("price", na_position="first").reset_index(drop=True)
+    path = tmp_path_factory.mktemp("sales") / "sales.db"
+    with sqlite3.connect(path) as connection:
+        df.to_sql("sales", connection, index=False)
+    return path, df
+
+
+@pytest.fixture()
+def pushdown(sales):  # type: ignore[no-untyped-def]
+    path, _ = sales
+    srv = build_server(
+        load_settings(log_level="WARNING", allowed_paths=[path.parent], sample_size=2000)
+    )
+    call(srv, "connect_database", {"alias": "s", "dsn": dsn_for(path)})
+    return srv
+
+
+def test_pushdown_statistics_are_exact(sales) -> None:  # type: ignore[no-untyped-def]
+    from eda_mcp.db.connect import open_engine
+    from eda_mcp.db.sqlprofile import profile_table
+    from eda_mcp.registry import Connection
+
+    path, df = sales
+    settings = load_settings(log_level="WARNING", allowed_paths=[path.parent], sample_size=2000)
+    opened = open_engine(dsn_for(path), settings)
+    try:
+        measured = profile_table(Connection("s", "sqlite", opened.engine), None, "sales", settings)
+    finally:
+        opened.engine.dispose()
+    assert measured.rows == len(df) and measured.sampled is not None
+    columns = {p.name: p for p in measured.profiles}
+
+    price, truth = columns["price"], df["price"]
+    assert (price.count, price.missing, price.unique) == (
+        truth.count(),
+        truth.isna().sum(),
+        truth.nunique(),
+    )
+    for stat, expected in (
+        ("mean", truth.mean()),
+        ("std", truth.std()),
+        ("min", truth.min()),
+        ("max", truth.max()),
+    ):
+        assert price.stats[stat] == pytest.approx(expected, rel=1e-9), stat
+    low, high = price.stats["iqr_bounds"]
+    assert price.stats["outliers_iqr"] == int(((truth < low) | (truth > high)).sum())
+
+    age = columns["age"]
+    assert age.stats["negatives"] == int((df["age"] < 0).sum())
+    assert age.stats["sentinels"] == {-999: int((df["age"] == -999).sum())}
+
+    country = columns["country"]
+    expected_top = df["country"].value_counts()
+    assert country.stats["top"] == {str(k): int(v) for k, v in expected_top.items()}
+
+    created = columns["created"]
+    assert created.stats["min"].startswith(df["created"].min())
+    assert created.stats["max"].startswith(df["created"].max())
+    assert "median_gap_days" not in created.stats  # a sample's gaps are not the table's
+
+
+def test_sampled_quartiles_are_unbiased_on_a_sorted_table(sales) -> None:  # type: ignore[no-untyped-def]
+    """A truncated over-draw keeps the low end of a sorted table; it must not."""
+    from eda_mcp.db.connect import open_engine
+    from eda_mcp.db.sqlprofile import profile_table
+    from eda_mcp.registry import Connection
+
+    path, df = sales
+    settings = load_settings(log_level="WARNING", allowed_paths=[path.parent], sample_size=2000)
+    opened = open_engine(dsn_for(path), settings)
+    try:
+        measured = profile_table(Connection("s", "sqlite", opened.engine), None, "sales", settings)
+    finally:
+        opened.engine.dispose()
+    price = {p.name: p for p in measured.profiles}["price"].stats
+    assert price["q1"] == pytest.approx(df["price"].quantile(0.25), rel=0.05)
+    assert price["q3"] == pytest.approx(df["price"].quantile(0.75), rel=0.05)
+
+
+def test_profile_tool_labels_what_was_sampled(pushdown) -> None:  # type: ignore[no-untyped-def]
+    payload = call(pushdown, "profile", {"source": "s.sales"})
+    sampled = payload["sampled"]
+    assert sampled["of"] == 30_000 and sampled["seed"] == 42
+    assert sampled["method"] == "rowid hash" and "quartiles" in sampled["estimated"]
+    assert payload["shape"] == [30_000, 5]
+    assert "duplicate_rows" not in payload  # cannot be judged from a sample
+    assert any("placeholder code(s) -999" in f for f in payload["findings"])
+    assert estimate_tokens(payload) <= 1500 * 1.15
+
+
+def test_pushdown_profile_is_reproducible(pushdown) -> None:  # type: ignore[no-untyped-def]
+    first = call(pushdown, "profile", {"source": "s.sales", "detail": "full"})
+    second = call(pushdown, "profile", {"source": "s.sales", "detail": "full"})
+    assert first == second
+
+
+def test_small_table_profile_matches_loading_it(connected) -> None:  # type: ignore[no-untyped-def]
+    in_place = call(connected, "profile", {"source": "shop.orders", "detail": "full"})
+    assert "sampled" not in in_place and in_place["duplicate_rows"] == 0
+    call(connected, "load_dataset", {"source": "shop.orders"})
+    loaded = call(connected, "profile", {"source": "orders", "detail": "full"})
+    in_place.pop("dataset"), loaded.pop("dataset")
+    assert in_place == loaded
+
+
+def test_pushdown_column_subset(pushdown) -> None:  # type: ignore[no-untyped-def]
+    payload = call(pushdown, "profile", {"source": "s.sales", "columns": ["price", "age"]})
+    assert set(payload["columns"]) == {"price", "age"}
+    missing = call(pushdown, "profile", {"source": "s.sales", "columns": ["nope"]})
+    assert missing["error"]["code"] == "COLUMN_NOT_FOUND"
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [
+        ("s.nope", "SOURCE_NOT_FOUND"),
+        ("nowhere", "SOURCE_NOT_FOUND"),
+        ("s.nope.sales", "SOURCE_NOT_FOUND"),
+    ],
+)
+def test_pushdown_profile_errors(pushdown, source, code) -> None:  # type: ignore[no-untyped-def]
+    assert call(pushdown, "profile", {"source": source})["error"]["code"] == code
+
+
+def test_profiling_never_changes_the_database(pushdown, sales) -> None:  # type: ignore[no-untyped-def]
+    path, _ = sales
+    query = "SELECT COUNT(*), SUM(price), SUM(age) FROM sales"
+    before = sqlite3.connect(path).execute(query).fetchone()
+    call(pushdown, "profile", {"source": "s.sales"})
+    assert sqlite3.connect(path).execute(query).fetchone() == before

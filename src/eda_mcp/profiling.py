@@ -281,7 +281,11 @@ def orientation(
 
 def summarise(df: pd.DataFrame, kinds: dict[str, ColumnKind], findings: list[Finding]) -> str:
     """One sentence stating scale and whether anything needs attention."""
-    rows, cols = df.shape
+    return summarise_counts(int(df.shape[0]), int(df.shape[1]), findings)
+
+
+def summarise_counts(rows: int, cols: int, findings: list[Finding]) -> str:
+    """``summarise`` for a table known by its size, such as one never loaded."""
     serious = sum(1 for f in findings if f.severity in (Severity.HIGH, Severity.MEDIUM))
     columns_flagged = len(
         {f.column for f in findings if f.column and f.severity is not Severity.LOW}

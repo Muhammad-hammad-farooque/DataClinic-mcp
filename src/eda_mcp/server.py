@@ -21,8 +21,15 @@ from eda_mcp.config import Settings, load_settings
 from eda_mcp.db.connect import env_name, open_engine, resolve_dsn
 from eda_mcp.db.introspect import describe_table, overview, tables
 from eda_mcp.db.load import load_query, load_table, split_reference
+from eda_mcp.db.sqlprofile import profile_table
 from eda_mcp.digest import BUDGETS, DEFAULT_BUDGET, Finding, Response, Severity, fit
-from eda_mcp.errors import ColumnNotFoundError, EDAError, ErrorCode, SourceTooLargeError
+from eda_mcp.errors import (
+    ColumnNotFoundError,
+    EDAError,
+    ErrorCode,
+    SourceNotFoundError,
+    SourceTooLargeError,
+)
 from eda_mcp.expressions import evaluate, present
 from eda_mcp.instructions import INSTRUCTIONS
 from eda_mcp.issues import (
@@ -42,6 +49,7 @@ from eda_mcp.profiling import (
     orientation,
     profile_frame,
     summarise,
+    summarise_counts,
 )
 from eda_mcp.profiling import analyze_column as deep_profile
 from eda_mcp.registry import Connection, Registry
@@ -173,13 +181,14 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                             "options= applies to files, not database sources",
                             "drop options=, or filter in the SQL with query=",
                         )
-                    if query is not None:
-                        loaded = load_query(registry.get_connection(source), query, settings, limit)
-                    else:
-                        assert reference is not None
+                    if reference is not None:
                         connection_alias, schema, table = reference
                         connection = registry.get_connection(connection_alias)
                         loaded = load_table(connection, schema, table, settings, limit)
+                    else:
+                        loaded = load_query(
+                            registry.get_connection(source), query or "", settings, limit
+                        )
                     df, report, origin = loaded.df, loaded.report, loaded.origin
                     preferred = loaded.default_alias
                     read["rows_available"] = loaded.available
@@ -227,7 +236,8 @@ def build_server(settings: Settings | None = None) -> MCPServer:
     @server.tool(
         name="profile",
         description=(
-            "Full-population statistics and ranked findings for a loaded dataset. "
+            "Statistics and ranked findings for a loaded dataset, or for a database table "
+            "(connection.table) computed inside the database without loading it. "
             "detail='standard' shows problem columns in full and rolls up clean ones; "
             "'brief' gives findings only; 'full' shows every column. columns= narrows "
             "to named columns, shown in full."
@@ -247,12 +257,38 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                         f"unknown detail level {detail!r}",
                         f"use one of {', '.join(DETAIL_LEVELS)}",
                     )
-                df = registry.get_dataset(source).df
-                kinds = column_kinds(df)
-                profiles = profile_frame(df, kinds, columns=columns)
+                # A loaded dataset is profiled in memory; an unloaded table
+                # (connection.table) where it lives, with SQL (spec 5.1).
+                sampled: dict[str, Any] | None = None
+                duplicates: int | None = None
+                table_findings: list[Finding] = []
+                if source in registry.datasets:
+                    df = registry.get_dataset(source).df
+                    kinds = column_kinds(df)
+                    profiles = profile_frame(df, kinds, columns=columns)
+                    rows, width = int(df.shape[0]), int(df.shape[1])
+                    if not columns:
+                        table_findings = frame_findings(df)
+                        duplicates = int(duplicated(df).sum())
+                else:
+                    reference = split_reference(source, registry.connections)
+                    if reference is None:
+                        raise SourceNotFoundError(
+                            source, sorted(registry.datasets) + sorted(registry.connections)
+                        )
+                    connection_alias, schema, table = reference
+                    measured = profile_table(
+                        registry.get_connection(connection_alias), schema, table, settings, columns
+                    )
+                    kinds, profiles = measured.kinds, measured.profiles
+                    rows, width, sampled = measured.rows, measured.columns, measured.sampled
+                    if measured.frame is not None and not columns:
+                        # Small enough to have been fetched whole: exact duplicates too.
+                        table_findings = frame_findings(measured.frame)
+                        duplicates = int(duplicated(measured.frame).sum())
 
                 by_column = {p.name: column_findings(p) for p in profiles}
-                findings = [] if columns else frame_findings(df)
+                findings = list(table_findings)
                 findings.extend(f for fs in by_column.values() for f in fs)
 
                 # Worst column first, so a budget cut drops the least important.
@@ -274,12 +310,9 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                 budget = int(BUDGETS["profile"] * PROFILE_COLUMN_SHARE)
                 blocks, cut = fit({name: digests[name] for name in shown}, budget)
 
-                body: dict[str, Any] = {
-                    "dataset": source,
-                    "shape": [int(df.shape[0]), int(df.shape[1])],
-                }
-                if not columns:
-                    body["duplicate_rows"] = int(duplicated(df).sum())
+                body: dict[str, Any] = {"dataset": source, "shape": [rows, width]}
+                if duplicates is not None:
+                    body["duplicate_rows"] = duplicates
                 if blocks:
                     body["columns"] = blocks
                 clean = [p.name for p in profiles if p.name not in problem]
@@ -295,15 +328,16 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                     "profile",
                     body=body,
                     findings=findings,
+                    sampled=sampled,
                     remedy="call again with columns=[...] to narrow",
                 )
                 if columns:
                     response.summary = (
-                        f"{len(profiles)} of {df.shape[1]} columns, {df.shape[0]:,} rows. "
+                        f"{len(profiles)} of {width} columns, {rows:,} rows. "
                         f"{len(problem)} need attention."
                     )
                 else:
-                    response.summary = summarise(df, kinds, findings)
+                    response.summary = summarise_counts(rows, width, findings)
 
                 record["columns_shown"] = len(blocks)
                 record["findings"] = len(findings)
