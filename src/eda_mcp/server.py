@@ -18,6 +18,8 @@ from mcp.types import ToolAnnotations
 
 from eda_mcp import __version__
 from eda_mcp.config import Settings, load_settings
+from eda_mcp.db.connect import env_name, open_engine, resolve_dsn
+from eda_mcp.db.introspect import describe_table, overview, tables
 from eda_mcp.digest import BUDGETS, DEFAULT_BUDGET, Finding, Response, Severity, fit
 from eda_mcp.errors import ColumnNotFoundError, EDAError, ErrorCode, SourceTooLargeError
 from eda_mcp.expressions import evaluate, present
@@ -41,7 +43,7 @@ from eda_mcp.profiling import (
     summarise,
 )
 from eda_mcp.profiling import analyze_column as deep_profile
-from eda_mcp.registry import Registry
+from eda_mcp.registry import Connection, Registry
 from eda_mcp.relations import (
     MAX_GROUPS,
     REPORT_STRENGTH,
@@ -70,6 +72,9 @@ PROFILE_COLUMN_SHARE = 0.6
 ROLLUP_NAMES = 20
 # Most rows query lists; beyond this an aggregate answers better.
 MAX_QUERY_ROWS = 100
+# explore_schema: share of the budget for table and column listings.
+SCHEMA_SHARE = 0.8
+DEFAULT_SCHEMA = {"sqlite": "main", "postgresql": "public"}
 # Kinds that can be related to others, and kinds that can split rows into groups.
 RELATABLE_KINDS = (
     ColumnKind.NUMERIC,
@@ -564,6 +569,146 @@ def build_server(settings: Settings | None = None) -> MCPServer:
             return _unexpected(exc)
 
     @server.tool(
+        name="connect_database",
+        description=(
+            "Open a read-only connection to a SQLite file or PostgreSQL database. "
+            "Credentials come from the environment: env_var= names a variable, else "
+            "EDA_MCP_DSN_<ALIAS>, else DATABASE_URL. Pass dsn= only as a last resort -- "
+            "it stays in the conversation. Returns dialect, version, schemas, table count."
+        ),
+        annotations=READ_ONLY_EXTERNAL,
+    )
+    def connect_database(
+        alias: str,
+        dsn: str | None = None,
+        env_var: str | None = None,
+        read_only: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            # Neither the DSN nor its presence is logged; only the alias.
+            with tool_call("connect_database", alias=alias) as record:
+                if alias in registry.connections or alias in registry.datasets:
+                    raise EDAError(
+                        ErrorCode.INVALID_OPERATION,
+                        f"the alias {alias!r} is already in use",
+                        "choose another alias, or close it with manage_sources",
+                    )
+                resolved = resolve_dsn(alias, dsn, env_var)
+                opened = open_engine(resolved.dsn, settings, read_only)
+                try:
+                    shape = overview(opened.engine, opened.dialect)
+                except Exception:
+                    opened.engine.dispose()  # never leave a pool open behind a failure
+                    raise
+                registry.add_connection(
+                    Connection(
+                        alias=alias,
+                        dialect=opened.dialect,
+                        engine=opened.engine,
+                        read_only=True,
+                        version=opened.version,
+                        database=opened.database,
+                        credentials=resolved.source,
+                    )
+                )
+
+                body: dict[str, Any] = {
+                    "connection": alias,
+                    "dialect": opened.dialect,
+                    "version": opened.version,
+                    "database": opened.database,
+                    "read_only": True,
+                    "credentials": resolved.source,
+                    **shape,
+                }
+                response = Response("connect_database", body=body)
+                if resolved.warning:
+                    response.add(
+                        Finding(
+                            Severity.MEDIUM,
+                            resolved.warning,
+                            recommendation=f"set {env_name(alias)} and reconnect next session",
+                        )
+                    )
+                schemas = len(shape["schemas"])
+                response.summary = (
+                    f"Connected to {opened.dialect} {opened.version}: {shape['tables']} table(s) "
+                    f"in {schemas} schema(s). Read-only. "
+                    f"Next: explore_schema(connection={alias!r})."
+                )
+                record["dialect"] = opened.dialect
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
+        name="explore_schema",
+        description=(
+            "Browse a connected database step by step: no arguments lists schemas (and "
+            "the tables, when there is only one schema); schema= lists its tables with "
+            "row estimates; table= gives columns, keys and indexes."
+        ),
+        annotations=READ_ONLY_EXTERNAL,
+    )
+    def explore_schema(
+        connection: str, schema: str | None = None, table: str | None = None
+    ) -> dict[str, Any]:
+        try:
+            with tool_call("explore_schema", connection=connection) as record:
+                conn = registry.get_connection(connection)
+                engine, dialect = conn.engine, conn.dialect
+                budget = int(BUDGETS["explore_schema"] * SCHEMA_SHARE)
+                body: dict[str, Any] = {"connection": connection}
+
+                if table is not None:
+                    schema = schema or DEFAULT_SCHEMA.get(dialect, "public")
+                    detail = describe_table(engine, dialect, schema, table)
+                    body.update({"schema": schema, "table": table})
+                    columns = detail.pop("columns")
+                    kept, cut = fit({str(i): c for i, c in enumerate(columns)}, budget)
+                    body["columns"] = list(kept.values())
+                    body.update(detail)
+                    if cut:
+                        body["more_columns"] = len(cut)
+                    size = f", {detail['rows']:,} rows" if "rows" in detail else ""
+                    if detail.get("row_count_exact") is False:
+                        size = f", ~{detail['rows']:,} rows (estimate)"
+                    summary = f"{table}: {len(columns)} column(s){size}."
+                else:
+                    shape = overview(engine, dialect)
+                    if schema is None and len(shape["schemas"]) == 1:
+                        schema = next(iter(shape["schemas"]))  # save a round trip
+                    if schema is None:
+                        body.update(shape)
+                        summary = (
+                            f"{len(shape['schemas'])} schema(s), {shape['tables']} table(s). "
+                            "Pass schema= to list one."
+                        )
+                    else:
+                        listing = tables(engine, dialect, schema)
+                        kept, cut = fit(listing, budget)
+                        body.update({"schema": schema, "tables": kept})
+                        if cut:
+                            body["more_tables"] = {
+                                "omitted": name_list(cut),
+                                "remedy": "call again with table= for any of them",
+                            }
+                        summary = (
+                            f"{len(listing)} table(s) and view(s) in {schema}. "
+                            "Pass table= for columns and keys."
+                        )
+                response = Response("explore_schema", body=body)
+                response.summary = summary
+                record["level"] = "table" if table else ("schema" if schema else "database")
+                return response.build()
+        except EDAError as exc:
+            return exc.to_dict()
+        except Exception as exc:  # the tool boundary must not raise
+            return _unexpected(exc)
+
+    @server.tool(
         name="manage_sources",
         description=(
             "List the datasets and connections open in this session, or close one to "
@@ -603,7 +748,12 @@ def build_server(settings: Settings | None = None) -> MCPServer:
                     for d in registry.datasets.values()
                 ]
                 connections = [
-                    {"alias": c.alias, "dialect": c.dialect, "read_only": c.read_only}
+                    {
+                        "alias": c.alias,
+                        "dialect": c.dialect,
+                        "database": c.database,
+                        "read_only": c.read_only,
+                    }
                     for c in registry.connections.values()
                 ]
                 record["datasets"] = len(datasets)

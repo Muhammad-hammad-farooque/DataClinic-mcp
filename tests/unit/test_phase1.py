@@ -338,6 +338,8 @@ def test_tools_registered_with_annotations(settings: Settings) -> None:
         "check_relationships": (True, False),
         "analyze_target": (True, False),
         "query": (True, True),
+        "connect_database": (True, True),
+        "explore_schema": (True, True),
     }
     assert set(tools) == set(expected)
     for name, (read_only, open_world) in expected.items():

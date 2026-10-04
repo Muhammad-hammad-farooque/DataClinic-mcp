@@ -101,12 +101,20 @@ class Dataset:
 
 @dataclass(slots=True)
 class Connection:
-    """A live database handle. Populated in phase 3."""
+    """A live database handle.
+
+    ``credentials`` names where the DSN came from -- safe to show -- and the
+    DSN itself is never stored here: the engine holds it, and nothing reads
+    it back out.
+    """
 
     alias: str
     dialect: str
     engine: Any
     read_only: bool = True
+    version: str = ""
+    database: str = ""
+    credentials: str = ""
     opened_at: float = field(default_factory=time.time)
 
 
@@ -121,6 +129,16 @@ class Registry:
         dataset = Dataset(alias=alias, df=df, origin=origin)
         self.datasets[alias] = dataset
         return dataset
+
+    def add_connection(self, connection: Connection) -> Connection:
+        self.connections[connection.alias] = connection
+        return connection
+
+    def get_connection(self, alias: str) -> Connection:
+        try:
+            return self.connections[alias]
+        except KeyError:
+            raise SourceNotFoundError(alias, sorted(self.connections)) from None
 
     def get_dataset(self, alias: str) -> Dataset:
         try:
